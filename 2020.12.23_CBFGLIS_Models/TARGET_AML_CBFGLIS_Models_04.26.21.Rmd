@@ -1,0 +1,3811 @@
+---
+title: "RNAseq Analysis of CBFA2T3-GLIS2 Transduced Cord Blood"
+author: "Jenny Smith"
+date: "12/28/20"
+output: html_document
+---
+
+
+# Set-up 
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2017.02.15_CBF-GLIS_DEG/2020.12.23_CBFGLIS_Models"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+node=Sys.info()[["nodename"]]
+if(!grepl("local", node)){
+  print(node)
+  options(bitmapType = 'cairo')
+  grDevices::X11.options(type='cairo')
+}
+
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+
+library(ggplot2)
+library(gridExtra)
+library(ggpubr)
+library(ggrepel)
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+
+library(DeGSEA)
+library(edgeR)
+getwd()
+```
+
+```{r}
+#hrbrthemes
+# devtools::install_github("thomasp85/patchwork")
+library(patchwork)
+```
+
+
+#Define Functions 
+
+```{r}
+kallisto_rmDups <- function(kallisto.df, geneIDmap){
+        
+      #Fix the PAR regions. Need to sum them since the fasta sequence is identical between PAR_Y and the X chromosome gene 
+        PAR <- filter(geneIDmap, grepl("_PAR_Y", gene_id))
+        PAR <- PAR %>% 
+          pull(gene_id) %>% 
+          gsub("_PAR_Y", "", .) %>% 
+          paste(., collapse="|")
+        
+        #For each PAR region, use ColSums to combine them 
+        idx <- grep(PAR, rownames(kallisto.df), value=TRUE) 
+        length(idx) #90 PAR_Y and their X-chromosome pair
+        
+        pairs <- lapply(seq(2, length(idx), by=2), 
+                        function(x){ 
+                          rows <- idx[c((x-1):x)]
+                          colSums(kallisto.df[rows,])
+                        }) %>% 
+          do.call(rbind, .)
+        
+        #Remove the PAR_Y rows and add in the summed gene expression
+        non_PAR <- idx[seq(2, length(idx), by=2)-1]
+        kallisto.df <- kallisto.df[!grepl("_PAR_Y$", rownames(kallisto.df)), ]
+        kallisto.df[non_PAR,] <- pairs
+
+
+        # dim(kallisto.df) #59808  2116
+        # head(kallisto.df[,1:5])
+
+        #convert Ensembl IDs to Gene Symbols
+        kallisto.df.sym <- as.data.frame(kallisto.df) %>%
+          rownames_to_column("gene_id") %>%
+          left_join(., dplyr::select(geneIDmap,gene_id,gene_name),
+                    by="gene_id") %>%
+          dplyr::select(gene_id,gene_name, everything())
+
+        #seperate out those genes without duplicate symbols
+        kallisto.df.sym_noDups <- kallisto.df.sym %>%
+          filter(!duplicated(gene_name), !duplicated(gene_name, fromLast = TRUE))
+
+        #identify which columns are numeric counts columns
+        numeric_cols <- sapply(kallisto.df.sym, function(x) is.numeric(x))
+        numeric_cols <- names(numeric_cols)[which(numeric_cols)]
+
+        #calculate the averate for all duplicate gene symbols.
+        kallisto.df.sym_Dups <- kallisto.df.sym %>%
+          filter(duplicated(gene_name) | duplicated(gene_name, fromLast = TRUE)) %>%
+          arrange(gene_name) %>%
+
+          #Calculate IQR to measure variance
+          rowwise() %>%
+          mutate(IQR=IQR(c_across(all_of(numeric_cols)))) %>%
+          ungroup() %>%
+
+          #use the max IQR expression to address duplicate gene symbols
+          group_by(gene_name) %>%
+          mutate(Rank=rank(IQR,ties.method= "first")) %>%
+          mutate(Keep=ifelse(Rank==max(Rank), TRUE, FALSE)) %>%
+          ungroup() %>%
+          dplyr::select(IQR:Keep, everything())
+
+        # head(kallisto.df.sym_Dups[,1:10])
+        # dim(kallisto.df.sym_Dups) #1719 2118
+
+        #remove duplicated gene_names
+        kallisto.df.sym_rmDups <- kallisto.df.sym_Dups %>%
+          filter(Keep) %>%
+          dplyr::select(-IQR,-Keep, -Rank)
+
+        #
+        # dim(kallisto.df.sym_rmDups) #174 2118
+        # head(kallisto.df.sym_rmDups)
+
+        kallisto.df.sym_final <- bind_rows(kallisto.df.sym_noDups, kallisto.df.sym_rmDups)
+        return(kallisto.df.sym_final)
+        # dim(kallisto.df.sym_final) #58263  2118
+        # head(kallisto.df.sym_final[,1:5])
+}
+```
+
+```{r}
+#Custom script to plot the experimental RNAseq expression with the patient samples. 
+scatter_comparison <- function(df,cols, genes){
+
+  expn <- logCPM.cbf[genes, df$Sample] %>% 
+      as.data.frame() %>% 
+      rownames_to_column("gene") %>% 
+      gather(Sample, log2CPM, -gene) %>% 
+      left_join(., dplyr::select(df, Comparisons, Sample), 
+                by="Sample")  %>% 
+      
+      group_by(Comparisons, gene) %>% 
+      mutate(Mean_Expression=mean(log2CPM)) %>% 
+      ungroup() %>% 
+      
+      dplyr::select(gene, Comparisons, Mean_Expression) %>% 
+      distinct() %>% 
+      
+      spread(Comparisons, Mean_Expression)
+    
+
+    col_x <- cols[1]
+    col_y <- cols[2]
+    form <- as.formula(paste(col_y, " ~ 0+", col_x))
+    reg <- lm(form, data = expn)
+    s <- summary(reg)
+    
+    
+    # plot(reg)
+    p.val <- round(s$coefficients[4],digits=3)
+    p.val <- ifelse(p.val == 0, "p<0.001",paste0("p=",p.val))
+    
+    y=quantile(expn[[col_x]])[5]
+    x=quantile(expn[[col_y]])[2]
+    
+    scatter <- ggplot(expn, aes_string(x=col_x, y=col_y)) +
+      geom_point(color="red4", alpha=0.5) +
+      geom_smooth(method="lm",formula='y ~ x',  color="black", linetype=2) +
+      annotate(geom="text", x = x, y=y, label=p.val, size=6) +
+      labs(title="Mean Expression of Common Dysregulated Genes") +
+      theme_classic() +
+      theme(text=element_text(size=14))
+  
+  
+  return(scatter)
+}
+
+```
+
+
+```{r fig.width=12}
+make_umap_2d <- function(umap_res.df, colors_list,dims){
+  
+  
+       subset <- filter(umap_res.df,grepl("CordBlood", AML_Subtype)) %>% 
+       mutate_at(vars(AML_Subtype), ~factor(.,levels=c("EC_Week1_GFP_CordBlood",
+                                                          "EC_Week1_CBFGLIS_CordBlood",
+                                                          "EC_Week6_CBFGLIS_CordBlood",
+                                                          "EC_Week12_CBFGLIS_CordBlood",
+                                                          "Myeloid_Week1_GFP_CordBlood",
+                                                          "Myeloid_Week1_CBFGLIS_CordBlood",
+                                                          "Myeloid_Week6_CBFGLIS_CordBlood")))
+        models <- unique(pull(subset, AML_Subtype))  
+        models <- models[order(models)]
+        shapes <-   case_when(grepl("Week1_", models) ~ 21,
+                    grepl("Week6",models) ~  24,
+                    grepl("Week12", models) ~ 22) %>% 
+          set_names(models)
+        
+        bulk_aml <- filter(umap_res.df,!grepl("CordBlood", AML_Subtype))
+        var1 <- rlang::sym(dims[1])
+        var2 <- rlang::sym(dims[2])
+        
+        group_labs <- bulk_aml %>% 
+          select(x,y,z, AML_Subtype) %>% 
+          group_by(AML_Subtype) %>% 
+          mutate(pos1 := quantile(!!var1, probs=0.85),
+                 pos2 := quantile(!!var2,probs=0.25)) %>% 
+          # mutate(pos1 := mean(!!var1),
+          #        pos2 := mean(!!var2)) %>% 
+          ungroup() %>% 
+          select(pos1,pos2,AML_Subtype) %>% 
+          distinct() %>% 
+          left_join(., rownames_to_column(data.frame(colors=cc_newData$AML_Subtype)),
+                    by=c("AML_Subtype"="rowname"))
+        
+        labs <- case_when(
+          all(dims %in% c("x","y")) ~ c("UMAP_1","UMAP_2"),
+          all(dims %in% c("x","z")) ~ c("UMAP_1","UMAP_3"),
+          all(dims %in% c("y","z")) ~ c("UMAP_2","UMAP_3"))    
+        
+        pos <- ifelse(all(dims %in% c("x","y")), "left", "none")
+        
+        ggplot() +
+          geom_point(data=bulk_aml,
+                     mapping=aes_string(x=dims[1],y=dims[2], color="AML_Subtype", group="AML_Subtype"),
+                     shape=19,
+                     size=bulk_aml$pt_size,
+                     alpha=0.6) +
+          geom_point(data=subset,
+                     mapping=aes_string(x=dims[1],y=dims[2],
+                                 fill="AML_Subtype",
+                                 shape="Time_Point_Group"),
+                     size=3,
+                     alpha=0.7) +
+          scale_color_manual(values=colors_list$AML_Subtype) +
+          scale_fill_manual(values=colors_list$AML_Subtype) +
+          scale_shape_manual(values=c("Week1"=21, "Week6"=24, "Week12"=22)) +
+          guides(fill=guide_legend(override.aes = list(size =5, 
+                                                       color=colors_list$AML_Subtype[grep("Cord", names(colors_list$AML_Subtype))],
+                                                       shape=shapes,
+                                                       alpha=1.0)),
+                 shape=guide_legend(override.aes = list(size=5)),
+                 color=guide_legend(override.aes = list(size=5,
+                                                        alpha=1.0))) +
+          labs(x=labs[1], y=labs[2]) +
+          theme_classic() +
+          geom_text_repel(data = group_labs, 
+                          mapping = aes(x=pos1, y=pos2, label=AML_Subtype),
+                          color=group_labs$colors,
+                          # nudge_x=c(2.0),
+                          # position = position_dodge(width = 2),  
+                          # segment.size=10.0,
+                          # min.segment.length=unit(5, "mm")
+                          ) +
+          theme(axis.text = element_text(size=16, color="black"), 
+                legend.position = pos,
+                axis.title = element_text(size=18, color="black")) 
+
+        
+}
+```
+
+```{r}
+make_facet_boxplots <- function(genes.of.interest, breaks){
+  
+  upper_lim <- ifelse(max(breaks) > max(genes.of.interest$CPM),  max(breaks), max(genes.of.interest$CPM))
+  
+  # breaks <- plyr::round_any(seq(0,m, length.out = 5), accuracy=10)
+  ggplot(data=genes.of.interest, aes(x=Comparisons, y=CPM, fill=Comparisons)) +
+      geom_boxplot(data=filter(genes.of.interest,Facet=="CBFA2T3-GLIS2 HSPCs"),
+                   mapping=aes(x=Comparisons, y=CPM, fill=Comparisons, color=Comparisons),
+                  alpha=0.2,outlier.shape = NA,  inherit.aes = TRUE) +
+      geom_beeswarm(data=filter(genes.of.interest,Facet=="CBFA2T3-GLIS2 HSPCs"),
+                    mapping=aes(x=Comparisons, y=CPM, fill=Comparisons,  color=Comparisons, shape=Time_Point_Group),
+                    size=3, alpha=0.75,
+                    inherit.aes = TRUE) +
+
+
+      geom_boxplot(data=filter(genes.of.interest,Facet != "CBFA2T3-GLIS2 HSPCs"),
+                   mapping=aes(x=Comparisons, y=CPM,  fill=Comparisons,color=Comparisons),
+                   alpha=0.25,
+                   outlier.shape = NA,
+                   inherit.aes = TRUE) +
+      geom_beeswarm(data=filter(genes.of.interest,Facet != "CBFA2T3-GLIS2 HSPCs",
+                                !c(gene == "BMP2" & Group=="NBM")),
+                   mapping=aes(x=Comparisons, y=CPM, fill=Comparisons,color=Comparisons,shape=Time_Point_Group),
+                  alpha=0.4,
+                  size=1.5,
+                  inherit.aes = TRUE) +
+      facet_wrap(~gene+Facet, ncol=6,scales = "free_x") +
+
+
+      scale_fill_manual(values=cc.cultures) +
+      scale_color_manual(values=cc.cultures) +
+      scale_shape_manual(values=c("Week1"=21, "Week6"=24, "Week12"=22,
+                                  "NBM"=19, "CBFA2T3-GLIS2"=19)) +
+
+      guides(fill=guide_legend(ncol=3),color=guide_legend(ncol=3), shape="none") +
+      scale_y_continuous(breaks = breaks, limits=c(0,upper_lim)) +
+
+      labs(x="",y="Expression (CPM)") +
+      theme_classic() +
+      theme(axis.title = element_text(size=14),
+            axis.text.y = element_text(color="black", size=14),
+            axis.text.x = element_text(angle=25, vjust=1, hjust=1, size=11,color="black"),
+            panel.border = element_rect(color="black", fill=NA),
+            plot.margin = margin(l=4, unit="cm"),
+            strip.text = element_text(size=14),
+            legend.text = element_text(size=14),
+            legend.position = "none")
+  
+  
+}
+```
+
+
+```{r fig.width=10, fig.height=6}
+make_gsva_facet_boxplots <- function(gsva_res, breaks){
+  
+  
+  # breaks <- plyr::round_any(seq(min(gsva_res$Score), max(gsva_res$Score), length.out = 5), accuracy=0.05)
+  start <- ifelse(min(gsva_res$Score) < min(breaks),min(gsva_res$Score), min(breaks))
+  end <- ifelse(max(gsva_res$Score) > max(breaks),max(gsva_res$Score), max(breaks))
+  
+  ggplot(data=gsva_res, aes(x=Comparisons, y=Score, fill=Comparisons)) +
+      geom_boxplot(data=filter(gsva_res,Facet=="CBFA2T3-GLIS2 HSPCs"),
+                   mapping=aes(x=Comparisons, y=Score, fill=Comparisons, color=Comparisons),
+                  alpha=0.2,outlier.shape = NA,  inherit.aes = TRUE) +
+      ggbeeswarm::geom_beeswarm(data=filter(gsva_res,Facet=="CBFA2T3-GLIS2 HSPCs"),
+                    mapping=aes(x=Comparisons, y=Score, fill=Comparisons,  color=Comparisons, shape=Time_Point_Group),
+                    size=3,  
+                    alpha=0.75,
+                    inherit.aes = TRUE) +
+
+
+      geom_boxplot(data=filter(gsva_res,Facet != "CBFA2T3-GLIS2 HSPCs"),
+                   mapping=aes(x=Comparisons, y=Score,  fill=Comparisons,color=Comparisons),
+                   alpha=0.25,
+                   outlier.shape = NA,
+                   inherit.aes = TRUE) +
+      ggbeeswarm::geom_beeswarm(data=filter(gsva_res,Facet != "CBFA2T3-GLIS2 HSPCs"),
+                   mapping=aes(x=Comparisons, y=Score, fill=Comparisons,color=Comparisons,shape=Time_Point_Group),
+                  alpha=0.4,
+                  size=1.5,
+                  inherit.aes = TRUE) +
+      facet_wrap(~path+Facet, ncol=2,scales = "free_x") +
+      
+
+
+      scale_fill_manual(values=cc.cultures) +
+      scale_color_manual(values=cc.cultures) +
+      scale_shape_manual(values=c("Week1"=21, "Week6"=24, "Week12"=22,
+                                  "NBM"=19, "CBFA2T3-GLIS2"=19)) +
+
+      guides(fill=guide_legend(ncol=3),color=guide_legend(ncol=3), shape="none") +
+      scale_y_continuous(breaks = breaks, limits=c(start,end)) + #limits=c(min(breaks), max(breaks))
+
+      labs(x="",y="Enrichment Score") +
+      theme_classic() +
+      theme(axis.title = element_text(size=14),
+            axis.text.y = element_text(color="black", size=14),
+            axis.text.x = element_text(angle=25, vjust=1, hjust=1, size=11,color="black"),
+            panel.border = element_rect(color="black", fill=NA),
+            plot.margin = margin(l=4, unit="cm"),
+            strip.text = element_text(size=14),
+            legend.text = element_text(size=14),
+            legend.position = "bottom")
+  
+  
+}
+```
+
+```{r}
+# https://github.com/gaospecial/ggVennDiagram/blob/master/R/multi_implement.R
+multi_union <- function ( ...,l = NULL){
+  if (is.null(l)) l <- list(...)
+  n <- length(l)
+  if (n < 3){
+    stop("At least three parameters.")
+  }
+  else {
+    v <- l[[1]]
+    for (i in 2:n){
+      v <- union(v,l[[i]])
+    }
+    return(v)
+  }
+}
+
+#' @rdname multi
+multi_intersect <- function ( ...,l = NULL){
+  if (is.null(l)) l <- list(...)
+  n <- length(l)
+  if (n < 3){
+    stop("At least three parameters.")
+  }
+  else {
+    v <- l[[1]]
+    for (i in 2:n){
+      v <- intersect(v,l[[i]])
+    }
+    return(v)
+  }
+}
+
+
+#' @rdname multi
+multi_setdiff <- function(...,l=NULL){
+  if (is.null(l)) l <- list(...)
+  n <- length(l)
+  if (n < 3){
+    stop("At least three parameters.")
+  }
+  else {
+    v <- l[[1]]
+    for (i in 2:n){
+      v <- setdiff(v,l[[i]])
+    }
+    return(v)
+  }
+}
+```
+
+
+# ClinData
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_05.21.21.csv"),
+                   na.strings = c("#N/A", "NA", ".",""))
+
+merged <- merged %>% 
+  dplyr::filter(!grepl("Unknown", USI)) %>%
+  dplyr::filter(Eligibility_Comments != "remove")
+
+
+dim(merged) #2217  150
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET,
+                                    "SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_08.12.21.csv")) 
+
+dim(sample_info)
+table(sample_info$Batch)
+```
+
+
+```{r}
+#Create an excel workbook to save the raw data used to generate the figures. 
+supp_table <- openxlsx::createWorkbook()
+
+
+# openxlsx::saveWorkbook(supp_table,
+#                        "CBFA2T3.GLIS2_HSPCs_Supplemental_Tables_Raw_Figure_Data.xlsx",
+#                        overwrite = T)
+```
+
+
+# Gene Annotations
+
+```{r}
+geneIDmap <- read.delim(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno_5.14.21.txt"))
+
+dim(geneIDmap) #59853    23
+# View(geneIDmap)
+```
+
+```{r}
+CBFGLISvsAML <- read.csv(file.path(PROJHOME,"0000.00.05_DEG_Lists/GRCh38_hg38/Kallisto/CBFA2T3GLIS2vsOthers_DEGs.csv"))
+
+dim(CBFGLISvsAML)
+# head(CBFGLISvsAML, n=10)
+```
+
+```{r}
+CBFGLISvsNBM <- read.csv(file.path(PROJHOME, "0000.00.05_DEG_Lists/GRCh38_hg38/Kallisto/CBFA2T3GLIS2vsNBM_DEGs.csv"))
+
+dim(CBFGLISvsNBM)
+# head(CBFGLISvsNBM, n=10)
+```
+
+```{r}
+intersection <- CBFGLISvsAML %>% 
+  select(gene_id=gene, gene_name, logFC, adj.P.Val) %>% 
+  rename_at(vars(logFC:adj.P.Val), ~paste0(.,"_CBFGLISvsAML")) %>% 
+  inner_join(., select(CBFGLISvsNBM, 
+                       gene_id=gene, logFC, adj.P.Val) %>% 
+               rename_at(vars(logFC:adj.P.Val), ~paste0(.,"_CBFGLISvsNBM")),
+             by="gene_id")
+
+
+# intersection
+# dim(intersection)
+# write.csv(intersection, "TARGET_AML_CBFGLISpatients_vsAML_vsNBM_intersection_DEGs.csv", row.names = FALSE)
+```
+
+
+# Raw Counts
+
+```{r}
+cts <- readRDS("Expression_Data/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Models_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS")
+colnames(cts)[grep("PATGIG|PATISD", colnames(cts))] <- gsub("_replicate", "", grep("PATGIG|PATISD", colnames(cts), value=T))
+
+geneIDs <- cts[,1:2]
+rownames(cts) <- cts$gene_name
+cts <- cts[,-c(1:2)]
+
+dim(cts)
+# head(cts[,1:5]) #58261  2166
+```
+
+```{r}
+TPM <- readRDS("Expression_Data/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Models_Kallisto_Quant_GeneLevel_Abundance_TPM.RDS")
+colnames(TPM)[grep("PATGIG|PATISD", colnames(TPM))] <- gsub("_replicate", "", grep("PATGIG|PATISD", colnames(TPM), value=T))
+
+
+geneIDs.tpm <- TPM[,1:2]
+rownames(TPM) <- TPM$gene_name
+TPM <- TPM[,-c(1:2)]
+
+
+dim(TPM)
+# head(TPM[,1:5])
+```
+
+
+## Remove Duplicate Genes
+
+```{r eval=FALSE}
+cts.otherAML <- readRDS(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
+
+
+# head(cts.otherAML[,1:5])
+# dim(cts.otherAML) #59853  2116
+
+cts.CBFGLIS <- readRDS("Expression_Data/TARGET_AML_CBFGLIS_Models_geneLevel_scaledTPM_counts.RDS")
+rownames(cts.CBFGLIS) <- gsub("\\.[0-9]{1,2}", "", rownames(cts.CBFGLIS))
+
+# 
+# head(cts.CBFGLIS[,1:5])
+# dim(cts.CBFGLIS) #58263    50
+
+
+identical(rownames(cts.CBFGLIS), rownames(cts.otherAML)) #TRUE
+table(rownames(cts.CBFGLIS) %in% rownames(cts.otherAML)) #TRUE
+# grep("^[0-9]{1,2}\\-", rownames(cts.CBFGLIS), value=T) #OK no  gene names edited by excel. 
+# table(rownames(cts) %in% rownames(cts.CBFGLIS)) #TRUE
+# any(colnames(cts.CBFGLIS) %in% colnames(cts.otherAML)) #OK FALSE
+
+cts.geneLevel <- cbind(cts.otherAML, cts.CBFGLIS)
+# dim(cts.geneLevel) #59853  2166
+# head(cts.geneLevel[,1:5])
+
+cts <- kallisto_rmDups(cts.geneLevel, geneIDmap = geneIDmap)
+
+head(cts[,1:5])
+dim(cts) #58263  2168 (it changed bc the damn last version I used of the geneIDmap had dates ughhhh)
+
+
+# saveRDS(cts,"Expression_Data/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Models_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS")
+```
+
+```{r eval=FALSE}
+TPM.otherAML <- readRDS(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Kallisto_Quant_GeneLevel_Abundance_TPM.RDS"))
+
+
+# head(TPM.otherAML[,1:5])
+# dim(TPM.otherAML) #59853  2116
+
+TPM.CBFGLIS <- readRDS("Expression_Data/TARGET_AML_CBFGLIS_Models_geneLevel_TPM_abundance.RDS")
+rownames(TPM.CBFGLIS) <- gsub("\\.[0-9]{1,2}", "", rownames(TPM.CBFGLIS))
+
+# 
+# head(TPM.CBFGLIS[,1:5])
+# dim(TPM.CBFGLIS) #59853    50
+
+
+identical(rownames(TPM.CBFGLIS), rownames(TPM.otherAML)) #TRUE
+table(rownames(TPM.CBFGLIS) %in% rownames(TPM.otherAML)) #TRUE
+# grep("^[0-9]{1,2}\\-", rownames(TPM.CBFGLIS), value=T) #OK no  gene names edited by excel.
+# table(rownames(TPM) %in% rownames(TPM.CBFGLIS)) #TRUE
+# any(colnames(TPM.CBFGLIS) %in% colnames(TPM.otherAML)) #OK FALSE
+
+# TPM.geneLevel <- cbind(TPM.otherAML, TPM.CBFGLIS)
+# dim(TPM.geneLevel) #59853  2166
+# head(TPM.geneLevel[,1:5])
+
+TPM <- kallisto_rmDups(TPM.geneLevel, geneIDmap = geneIDmap)
+
+# head(TPM[,1:5])
+# dim(TPM) #58263  2168 
+
+
+# saveRDS(TPM,"Expression_Data/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Models_Kallisto_Quant_GeneLevel_Abundance_TPM.RDS")
+```
+
+# Define Samples and Contrasts 
+
+```{r}
+CBFGLIS.models <- read.csv("TARGET_AML_CBFGLIS_CordBlood_Models_Sample_Conditions.csv")
+
+# head(CBFGLIS.models)
+dim(CBFGLIS.models) #50 56
+# View(CBFGLIS.models)Ω
+```
+
+```{r}
+CBFGLIS_samples <- CBFGLIS.models %>%  
+  filter(grepl("CordBlood", AML_Subtype),
+         !grepl("sort", Sample),
+         !grepl("TARGET.20.CB34pos.Dayminus1.00.01R", Sample)) %>%
+  
+  mutate_at(vars(Time_Point_Group), ~case_when(
+    .=="Week7" ~ gsub("7", "6", .),
+    TRUE ~ .)) %>% 
+  bind_rows(., filter(sample_info, grepl("CD34|NBM|GLIS2",AML_Subtype),
+                      grepl("diagnostic|NBM|CD34_PB", Time_point))) %>%
+  left_join(.,dplyr::select(merged, USI, M7_AML,
+                     BM.blasts=Bone.marrow.leukemic.blast.percentage....),
+            by="USI") %>%
+  mutate_at(vars(c("Time_point","Time_Point_Group","Culture_condition",
+                   "Transduction_condition","M7_AML")),
+            ~case_when(
+              is.na(.) ~ AML_Subtype,
+              TRUE ~ .)) %>%
+  
+  mutate(Comparisons=paste(Culture_condition, Time_Point_Group, AML_Subtype, sep="_")) %>%
+  mutate(Comparisons=gsub("^(CBFA2T3.GLIS2|NBM|CD34_PB)_.+", "\\1", Comparisons)) %>% 
+  
+  mutate(USI1=USI,
+         USI=Sample) %>% 
+  arrange(AML_Subtype) %>% 
+  set_rownames(.$Sample)
+
+
+
+dim(CBFGLIS_samples) #182  64
+table(CBFGLIS_samples$Comparisons)
+# colnames(CBFGLIS_samples)[colnames(CBFGLIS_samples) %in% colnames(sample_info)]
+```
+
+
+```{r}
+samps_all <- sample_info %>% 
+  filter(grepl("^AML|CD34_PB|NBM|Normal_PB|^FlowSorted", Group))  %>% 
+  mutate_at(vars(Time_point), ~case_when(
+    Group=="FlowSorted" & grepl("Unsorted.0[39]A",Sample) ~ "diagnostic",
+    TRUE ~ .)) %>% 
+  mutate_at(vars(Sample), ~case_when(
+    grepl("PATGIG|PATISD", .) ~ gsub("_replicate", "", .),
+    TRUE ~ .)) %>% 
+  filter(grepl("diagnostic|CD34_PB|NBM|Normal_PB", Time_point)) %>% 
+  
+  #Keep only the CBFGLIS samples of interest from EC and Myeloid cultures
+  bind_rows(., filter(CBFGLIS_samples, grepl("^EC|^Myeloid", Comparisons), 
+                      !grepl("Myeloid_Week12|EC_Week9|Myeloid_Week6_GFP_CordBlood", Comparisons),
+                      !grepl("mock", Sample))) %>% 
+  mutate_at(vars(Time_Point_Group), ~case_when(
+    is.na(.) ~ Time_point,
+    TRUE ~ .)) %>% 
+  filter(Sample %in% colnames(cts),
+         !grepl("_replicate", Sample)) %>% 
+  set_rownames(.$Sample)
+  
+
+
+dim(samps_all)
+table(samps_all$Group)
+table(samps_all$Time_Point_Group)
+table(samps_all$Comparisons)
+
+
+# table(CBFGLIS_samples$Sample  %in% samps_all$Sample)
+```
+
+
+
+
+
+# Subset Counts Data
+
+```{r}
+in_counts <- cts[,CBFGLIS_samples$Sample]
+
+dim(in_counts) #58263   182
+head(in_counts[,1:5])
+```
+
+```{r}
+AML <- ! grepl("BM[0-9]|R[O0][0-9]", colnames(in_counts))
+keep <- rowSums(cpm(in_counts[,AML]) >= 1) >= 0.05*ncol(in_counts[,AML])
+cts.filtered <- in_counts[keep, ]
+
+dge <- DGEList(counts=cts.filtered)
+dge <- calcNormFactors(dge,method = "TMMwsp")
+
+logCPM <- edgeR::cpm(dge,log=TRUE,normalized.lib.sizes=TRUE, prior.count=1)
+CPM <- edgeR::cpm(dge,log=FALSE,normalized.lib.sizes=TRUE, prior.count=1)
+
+dim(logCPM) #25764   183
+head(logCPM[,1:5])
+```
+
+```{r}
+genes <- grep("^ENSG", geneIDs$gene_id)
+
+cts_all <- cts[genes, samps_all$Sample]
+AML <- !grepl("BM[0-9]|R[O0][0-9]", colnames(cts_all))
+keep <- rowSums(cpm(cts_all[,AML]) >= 1) >= 0.025*ncol(cts_all[,AML])
+
+#Filter to remove low/zero count genes
+cts_all <- cts_all[keep, ]
+
+
+dim(cts_all) #27,245  1618
+```
+
+
+
+# Unsupervised Clustering
+
+*unsupervised clustering first
+PCA/MDS/UMAP
+
+samples correlations with heirarchal clustering
+
+*heatmap with DEGs from CBFGLIS samples vs OtherAML 
+- include D7, ~D45, D84 and GFP samples 
+- global view of which blocks of genes are shared. 
+
+```{r}
+library(DelayedArray)
+
+# Mean vs Dispersion Feature Selection 
+obj <- seqGlue::calc_dispersion(as.matrix(CPM), removeOutliers = TRUE) #removes outlier genes/transcripts based on cooks distance
+gc()
+
+sg_all <- seqGlue::get_selected_genes(seqGlue::select_genes(obj, top_n=NULL))
+length(sg_all) #4890 genes 
+# head(sg_all)
+```
+
+
+## PCA
+
+```{r}
+# cc <- list("fill"=,"color"=)
+```
+
+```{r}
+p <- pull(CBFGLIS.models, AML_Subtype) %>% 
+  set_names(CBFGLIS.models$Sample)
+
+PCA_models <- PCA(expnData = cts.filtered,
+                  phenovector = p,
+                  title = "PCA Analysis with Transduced Cord Blood Models", 
+                  ntop = 1000,
+                  round = T,PC3=TRUE)
+```
+
+```{r fig.height=5, fig.width=15 }
+pm.1 <- PCA_models$pca_plot + scale_color_brewer(palette = "Paired")
+pm.2 <- PCA_models$pca_plot2 + scale_color_brewer(palette = "Paired")
+
+# pdf("Figures/CBFGLIS_Models_Controls_Top1000_mostVariedGenes_PCA_plot.pdf", height = 5, width = 15)
+pm.1 + pm.2
+# dev.off()
+```
+
+
+```{r}
+p <- pull(CBFGLIS_samples, AML_Subtype) %>% 
+  set_names(CBFGLIS_samples$Sample)
+
+PCA_simple <- PCA(expnData = cts.filtered,
+                  phenovector = p,
+                  title = "PCA Analysis with Patients and Cord Blood Models", 
+                  ntop = 1000,
+                  round = T,PC3=TRUE)
+```
+
+```{r fig.height=5, fig.width=15}
+ps.1 <- PCA_simple$pca_plot + scale_color_brewer(palette = "Paired")
+ps.2 <- PCA_simple$pca_plot2 + scale_color_brewer(palette = "Paired")
+
+# pdf("Figures/CBFGLIS_Pts_Models_Controls_Top1000_mostVariedGenes_PCA_plot.pdf", height = 5, width = 15)
+ps.1 + ps.2
+# dev.off()
+```
+
+```{r}
+class(PCA_simple$vst)
+dim(assay(PCA_simple$vst))
+
+table(rownames(assay(PCA_simple$vst)) %in% sg_all)
+```
+
+```{r}
+PCA_res <- pca_custom(expnData = assay(PCA_simple$vst)[sg_all, CBFGLIS_samples$Sample],
+                      CDE=CBFGLIS_samples,
+                      fillCol = "AML_Subtype",
+                      colorCol = "Time_point",
+                      PC3 = TRUE)
+```
+
+```{r fig.height=7, fig.width=18}
+pca.p1 <- PCA_res$plot.1 +
+  scale_fill_brewer(palette = "Paired") +
+  scale_color_brewer(palette = "Set3")
+
+pca.p2 <- PCA_res$plot.2 +
+  scale_fill_brewer(palette = "Paired") +
+  scale_color_brewer(palette = "Set3")
+
+# pdf("Figures/CBFGLIS_Pts_Models_Controls_Condition_TimePoint_PCA_plot.pdf", height=7, width = 18)
+pca.p1 + pca.p2
+# dev.off()
+```
+
+## Heatmap
+
+Heat map of CBFGLIS genes showing clustering of the primary NBM samples, primary CBF AML; GFP EC wk 1; CBF EC wk 1, 7(day 42+day45), 12 (day 84+day87); GFP MC wk1; and CBF MC wk 1, 6, 12.
+
+```{r}
+heatmap.samps <- CBFGLIS_samples %>% 
+  filter(!grepl("pool", Sample)) %>% 
+  #CD34_PB
+  filter(grepl("CBFA2T3|NBM|EC_Week1_GFP|EC_Week(1|6|12)_CBFGLIS|Myeloid_Week1_GFP|Myeloid_Week(1|6)_CBFGLIS",
+               Comparisons)) %>% 
+  filter(!c(Group=="NBM" & grepl("_rep", Sample))) %>% 
+  mutate(Comparisons=factor(Comparisons, levels=c(
+                                                  # "CD34_PB", 
+                                                  "NBM","CBFA2T3-GLIS2",
+                                                    "EC_Week1_GFP_CordBlood",
+                                                    "EC_Week1_CBFGLIS_CordBlood",
+                                                    "EC_Week6_CBFGLIS_CordBlood",
+                                                    "EC_Week12_CBFGLIS_CordBlood",
+                                                    "Myeloid_Week1_GFP_CordBlood",
+                                                    "Myeloid_Week1_CBFGLIS_CordBlood",
+                                                    "Myeloid_Week6_CBFGLIS_CordBlood"))) %>%
+  mutate(Labels=gsub("_CordBlood", "", Comparisons),
+         Time_Point_Group=factor(ifelse(grepl("NBM|CBF", Time_Point_Group), "None", Time_Point_Group),
+                                 levels = c("Week1","Week6", "Week12","None"))) %>% 
+  arrange(desc(Comparisons)) %>%
+  set_rownames(.$Sample)
+  
+# levels(heatmap.samps$Comparisons)
+table(heatmap.samps$Labels)
+
+
+Cols <- c("Time_Point_Group","Labels")
+# cc_heatmaps <- colorCodes_aheatmap(df=select(heatmap.samps,all_of(Cols)))
+cc_heatmaps <- list()
+cc_heatmaps[["Time_Point_Group"]] <- c("Week1" = "skyblue",
+                 "Week6" = "dodgerblue2",
+                 "Week12" = "navy",
+                 "None" = "white")
+# cc_heatmaps[["Culture_condition"]] <- c("CBFA2T3-GLIS2"="mediumorchid2", 
+#                                         "EC"="blue2", 
+#                                         "Myeloid"="deeppink",
+#                                         "NBM"="grey20")
+cc_heatmaps[["Labels"]] <- c("CBFA2T3-GLIS2"="mediumorchid2", 
+                                       "NBM"="grey20",
+                                       "EC_Week1_GFP"="springgreen4",
+                                       "EC_Week1_CBFGLIS"="blue2",
+                                       "EC_Week6_CBFGLIS"="blue2",
+                                       "EC_Week12_CBFGLIS"="blue2", 
+                                       "Myeloid_Week1_GFP"="orange",
+                                       "Myeloid_Week1_CBFGLIS"="deeppink",
+                                       "Myeloid_Week6_CBFGLIS"="deeppink")
+# cc_heatmaps
+# View(heatmap.samps)
+table(heatmap.samps$Time_Point_Group)
+```
+
+```{r}
+high.FC <- CBFGLISvsAML %>%  
+  filter(abs(logFC) >= quantile(abs(logFC))[4]) %>%   #75th percentile
+  filter(adj.P.Val < 0.001)
+
+p <- pull(heatmap.samps, Comparisons) %>% set_names(heatmap.samps$Sample)
+g <- intersect(rownames(in_counts), high.FC$gene_name)
+length(g) #1116
+
+anno <- DeGSEA::create_HA_Labs_Hmap(expn=in_counts[,heatmap.samps$Sample],
+                                    geneList = g,
+                                    cc = cc_heatmaps, 
+                                    CDE = heatmap.samps,
+                                    cols = names(cc_heatmaps))
+anno
+```
+
+
+```{r}
+make_TMMCPM <- function(expnData, genelist,percent=0.01,add.count=0.01){
+    AML <- ! grepl("BM[0-9]|R[0O][0-9]", colnames(expnData))
+    AMLsamples <- ncol(expnData[,AML])
+
+    dge <- DGEList(counts = expnData)
+    #updated on 7/26/18 - really only changes the heatmap coloring since the genes for each heatmap are already known to pass this threshold.
+    keep.dge <- rowSums(cpm(dge)[,AML] >= 1) >= max(2,(percent*AMLsamples)) #X% of AML samples has cpm of at least 1 for a gene. This should help if looking for genes that are low or absent in NBMs vs AMLs
+    keep.dge[names(keep.dge) %in% genelist] <- TRUE
+    
+    dge <- dge[keep.dge,] #subset for those genes with cmp >= 1 per gene in AML samples
+    dge <- calcNormFactors(dge)
+
+    TMMCPM <- cpm(dge, normalized.lib.sizes = TRUE) #log = TRUE, prior.count = add.count
+    
+    #Use +1 to avoid outliers.... not necessarily true will revisit this. Using 0.01 actually cleans up the rare fusions clustering. 
+    TMMCPM <- as.data.frame(apply(TMMCPM, 2, function(x) log2(x + add.count)))
+}
+```
+
+
+```{r}
+#oof this had a filter step that I did not remember. So ofc, I am missing 36 genes from the TMMCPM matrix output. so now I need to fix that. 
+
+input <-make_TMMCPM(expnData = in_counts[,heatmap.samps$Sample], genelist = g)
+
+dim(input) 
+
+d <- dge_dendrograms(expnData = input[g,heatmap.samps$Sample],
+                pheno = p,
+                method = "ward.D2",
+                log = TRUE,
+                createDGE = FALSE,
+                filterTopGenes = FALSE,
+                genelist = NULL)
+
+# length(g)
+# table(rownames(in_counts) %in% g)
+# table(rownames(input) %in% g)
+# dim(d$TMMCPM)
+```
+
+```{r}
+sig.genes <- high.FC %>% 
+  filter(gene_name %in% g) %>% 
+  group_by(gene_name) %>% 
+  filter(adj.P.Val == min(adj.P.Val)) %>% 
+  filter(!duplicated(gene_name)) %>% 
+  ungroup()
+
+
+dim(sig.genes)
+
+# table(sig.genes$logFC > 0)
+# write.csv(sig.genes, "TARGET_AML_CBFGLIS_vs_AML_75thPercentile_AbsoluteLogFC_Signature_Geneset.csv", row.names = FALSE)
+
+gene_set_genes <- openxlsx::read.xlsx("Manuscript/Raw_Data/TARGET_AML_CBFGLIS_MS_GSEA_Cust_Gene_Sets_AL.xlsx",
+                                      sheet="CG Signature (gene set)")
+
+
+#write the CBFGLISvsAML DEGs with the signature genes noted:
+CBFGLISvsAML <- CBFGLISvsAML %>% 
+  mutate(CBFGLIS_Signature_GeneSet_ExtendedDataFigure6b=case_when(
+    gene %in% sig.genes$gene ~ "Signature Gene",
+    TRUE ~ "")) %>% 
+  mutate(CBFGLIS_Signature_GeneSet_Figure2j=case_when(
+    gene %in% gene_set_genes$gene ~ "Included in Geneset",
+    TRUE ~ ""))
+
+table(CBFGLISvsAML$CBFGLIS_Signature_GeneSet_ExtendedDataFigure6b)
+table(CBFGLISvsAML$CBFGLIS_Signature_GeneSet_Figure2j)
+
+
+# openxlsx::addWorksheet(supp_table,
+#                        sheetName = "CBFA2T3-GLIS2 DEGs")
+# openxlsx::writeData(supp_table,
+#                     sheet = "CBFA2T3-GLIS2 DEGs",
+#                     CBFGLISvsAML,
+#                     keepNA=FALSE,
+#                     rowNames=FALSE)
+```
+
+
+
+```{r fig.width=20, fig.height=8}
+#The order of the dendrogram clusters changed (why I am unsure) so I need to specify the order. 
+ord <- c(ncol(d$TMMCPM):1)
+t <- dendextend::rotate(as.dendrogram(d$samp.c1),  order=ord)
+
+#The heatmap dendrogram rotation changes since I last ran it - but results are the same. 
+mat_temp <- matrix(ncol=ncol(d$TMMCPM), nrow=1, dimnames = list("", labels(t))) %>%
+  as.data.frame() %>%
+  select(TARGET.00.RO02496.14A.01R:TARGET.20.D7.Myeloid.CBFA2T3_GLIS2.2.00.01R,
+         TARGET.20.PAYGWX.Unsorted.09A.01R:TARGET.20.PATHVG.03A.01R,
+         TARGET.20.PAVPKA.09A.01R:TARGET.20.D49.Myeloid.CBFA2T3_GLIS2.2.00.01R,
+         TARGET.20.D45.EC.CBFA2T3_GLIS2.3.00.01R:TARGET.20.D45.EC.CBFA2T3_GLIS2.1.00.01R,
+         TARGET.20.D87.EC.CBFA2T3_GLIS2.scbulkleftovers.00.01R:TARGET.20.D84.EC.CBFA2T3_GLIS2.2.00.01R)
+#   # select(TARGET.00.RO02580.14A.01R:TARGET.20.D7.Myeloid.CBFA2T3_GLIS2.2.00.01R,
+#   #        TARGET.20.PAYGWX.Unsorted.09A.01R:TARGET.20.PAWYZR.09A.01R,
+#   #        TARGET.20.PAVPKA.09A.01R:TARGET.20.D49.Myeloid.CBFA2T3_GLIS2.2.00.01R,
+#   #        TARGET.20.D45.EC.CBFA2T3_GLIS2.3.00.01R:TARGET.20.D45.EC.CBFA2T3_GLIS2.1.00.01R,
+#   #        TARGET.20.D87.EC.CBFA2T3_GLIS2.scbulkleftovers.00.01R:TARGET.20.D84.EC.CBFA2T3_GLIS2.2.00.01R)
+
+
+par(mar=c(25,4,10,0), cex=0.8)
+plot(dendextend::rotate(as.dendrogram(d$samp.c1),  order=ord))
+plot(dendextend::rotate(as.dendrogram(d$samp.c1),  order=colnames(mat_temp)))
+
+# View(colnames(mat_temp))
+
+```
+
+
+```{r fig.height=10, fig.width=20}
+# pdf("Figures/CBFGLIS_Pts_Models_Controls_DEGsvsOtherAML_75thPercentileFC_Heatmap_7.23.21.pdf", height = 10, width=20)
+
+HA_AML <- ComplexHmap(mat = d$TMMCPM, #logCPM[DEGs.AML, heatmap.samps$Sample]
+                      name = "Z-Scores",
+                      scale=TRUE,
+                      dge_dendrograms.res = d,
+                      samp_dend_order = colnames(mat_temp), #colnames(mat_temp)
+                      hmap_anno_obj = anno$annoColumn)
+
+HA_AML
+# dev.off()
+```
+
+```{r}
+# dim(HA_AML@matrix)
+# dim(d$TMMCPM)
+
+# openxlsx::addWorksheet(supp_table,
+#                        sheetName = "CBFA2T3-GLIS2 Heatmap Z-Scores")
+# openxlsx::writeData(supp_table,
+#                     sheet = "CBFA2T3-GLIS2 Heatmap Z-Scores",
+#                     HA_AML@matrix,
+#                     keepNA=FALSE,
+#                     rowNames=TRUE)
+
+```
+
+```{r fig.height=10, fig.width=20}
+# pdf("Figures/CBFGLIS_Pts_Models_Controls_DEGsvsOtherAML_z-scores_1.8.20.pdf", height = 10, width=20)
+HA_AML <- ComplexHmap(mat = logCPM[DEGs.AML, heatmap.samps$Sample], 
+                      name = "Z-Scores",
+                      scale=TRUE,
+                      hmap_anno_obj = anno$annoColumn)
+
+HA_AML
+# dev.off()
+```
+
+```{r}
+anno.NBM <- create_HA_Labs_Hmap(expn=logCPM[DEGs.NBM,CBFGLIS_samples$Sample],
+                    geneList = DEGs.NBM,
+                    CDE = CBFGLIS_samples,
+                    cc = cc_heatmaps,
+                    cols = Cols)
+
+HA_NBM <- ComplexHmap(mat = logCPM[DEGs.NBM,CBFGLIS_samples$Sample],
+                      name = "Z-Scores",
+                      scale = TRUE,
+                      hmap_anno_obj = anno.NBM$annoColumn)
+```
+
+```{r fig.height=10, fig.width=20}
+# pdf("Figures/CBFGLIS_Pts_Models_Controls_DEGsvsNBM_Heatmap.pdf", height = 10, width=20)
+HA_NBM
+# dev.off()
+```
+
+## UMAP 
+
+```{r}
+bulk <- !grepl("CordBlood|CD34_PB", samps_all$Group) & 
+  !grepl("AML, NOS", samps_all$AML_Subtype) & 
+  !grepl("No.Primary.Fusion", samps_all$AML_Subtype) 
+
+samps_bulk <- samps_all[bulk,] 
+samps_bulk$AML_Subtype <- ifelse(grepl("KMT2A|CBFB|RUNX1|CBFA2T3-GLIS2|NBM", samps_bulk$AML_Subtype),samps_bulk$AML_Subtype, "Other")
+
+table(samps_bulk$AML_Subtype)
+
+
+newData <- samps_all[grepl("CordBlood", samps_all$Group),] 
+table(newData$Comparisons)
+```
+
+```{r}
+Cols <- c("AML_Subtype","Group",
+          "Batch","Time_Point_Group","Tissue")
+
+all(Cols %in% colnames(samps_bulk))
+
+colors37 = c("#466791","#60bf37","#953ada","#4fbe6c","#ce49d3","#a7b43d","#5a51dc","#d49f36","#552095","#507f2d","#db37aa","#84b67c","#a06fda","#df462a","#5b83db","#c76c2d","#4f49a3","#82702d","#dd6bbb","#334c22","#d83979","#55baad","#dc4555","#62aad3","#8c3025","#417d61","#862977","#bba672","#403367","#da8a6d","#a79cd4","#71482c","#c689d0","#6b2940","#d593a7","#895c8b","#bd5975")
+
+cc <- colorCodes_aheatmap(df=samps_bulk[,Cols])
+cc$AML_Subtype["Other"] <- "bisque"
+cc$AML_Subtype["NBM"] <- "grey70"
+cc$AML_Subtype["CBFB-MYH11"] <- "skyblue2"
+cc$AML_Subtype["KMT2A"] <- "khaki3"
+cc$AML_Subtype["RUNX1-RUNX1T1"] <- "burlywood3"
+cc$AML_Subtype["CBFA2T3-GLIS2"] <- "mediumorchid2"
+
+
+par(mar=c(10,5,5,5))
+barplot(rep(1,length(cc$AML_Subtype)),col = cc$AML_Subtype, names.arg = names(cc$AML_Subtype), las=2)
+```
+
+```{r}
+suppressPackageStartupMessages(library(DelayedArray))
+
+#TFIDF TRANSFORMED Counts
+# Term Frequency - Inverse Document Frequency (TF-IDF) 
+# https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6101073/
+
+cts_subset <- cts_all[,c(samps_bulk$Sample, newData$Sample)]
+cell_total <- apply(cts_subset, 2, sum)
+geomean <- exp(mean(log(cell_total)))
+sf <- cell_total/geomean
+sf.scaled <- t(t(cts_subset)/sf)
+
+
+tf_all <- seqGlue::tf_idf_transform(sf.scaled)
+# tf_alllog <- tf_idf_transform(log2(sf.scaled+1))
+
+gc()
+
+# Mean vs Dispersion Feature Selection 
+obj <- seqGlue::calc_dispersion(as.matrix(cts_subset), removeOutliers = TRUE) #removes outlier genes/transcripts based on cooks distance
+gc()
+
+sg_all <- seqGlue::get_selected_genes(seqGlue::select_genes(obj, top_n=NULL))
+tf_all <- tf_all[sg_all,]
+# tf_alllog <- tf_alllog[sg_all,]
+
+dim(tf_all) 
+# dim(tf_alllog) 
+range(tf_all)
+
+
+##### PCA (doesnt add enough clarity to makeu p for the runtime)
+# norm_cts_log <- log2(sf.scaled+1)
+# norm_cts_scaled <- t(scale(t(norm_cts_log), center = TRUE, scale = TRUE))
+# # pca_bulk <- run_jackstraw(TFIDF_Matrix = norm_cts_scaled[sg_all,])
+# # pca_bulk <- readRDS("Jackstraw_pca_bulk_samples_2021-05-05.RDS")
+# 
+# # length(pca_bulk$input_features)
+# # pca_bulk$N_comp #72
+# # saveRDS(pca_bulk, "Jackstraw_pca_bulk_samples_2021-05-05.RDS")
+```
+
+
+n_neighbors	
+The size of local neighborhood (in terms of number of neighboring sample points) used for manifold approximation. Larger values result in more global views of the manifold, while smaller values result in more local data being preserved.
+
+min_dist	
+The effective minimum distance between embedded points. Smaller values will result in a more clustered/clumped embedding where nearby points on the manifold are drawn closer together, while larger values will result on a more even dispersal of points. 
+
+
+
+```{r}
+dds <- DESeq2::DESeqDataSetFromMatrix(round(cts_subset, digits = 0),
+                                      colData = rbind(samps_bulk, newData),
+                                      design = ~ 1)
+
+
+vst <- DESeq2::vst(dds, blind = TRUE)
+dim(vst)
+
+
+in_vst <- SummarizedExperiment::assay(vst)[sg_all,]
+
+dim(in_vst)
+head(in_vst[,1:5])
+```
+
+```{r}
+umap_bulk <- UMAP_workflow(TFIDF_Matrix = in_vst, 
+                           scale_data=FALSE,
+                           input_features = sg_all,
+                            samples_vector = samps_bulk$Sample,
+                            sample_info_df = samps_bulk,
+                            Columns_for_Plots = Cols,
+                            cc = cc, 
+                            min_dist = 0.01,
+                            n_neighbors=35,
+                            k2=10,
+                            res2=0.025)
+
+
+
+# saveRDS(umap_bulk,"TARGET_AML_sg2000_md0.005_nn40_UMAP_primary.fusion_bulk_samples_05.12.21.RDS")
+ # saveRDS(umap_bulk,"TARGET_AML_sg6678_md0.01_nn38_UMAP_primary.fusion_bulk_samples_05.12.21.RDS")
+
+# saveRDS(umap_bulk,"TARGET_AML_sg6678_md0.01_nn35_UMAP_primary.fusion_bulk_samples_05.12.21.RDS")
+```
+
+
+Best Params with TFIDF
+___________
+nn = 5-7 
+min_dist = 0.05 - 0.005
+
+
+Best Params with VST
+______________
+all samps
+nn=12
+min_dist = 0.005
+
+Has Known Fusion samps
+nn=40
+min_dist=0.005
+
+```{r fig.height=10, fig.width=10}
+umap_bulk$umap_2D_scatter[[1]]
+```
+
+```{r}
+scatter_plots_3d(umap_workflow_res = umap_bulk, 
+                 Group_Column = "AML_Subtype", 
+                 Cols=c("Sample",Cols), 
+                 cc=cc$AML_Subtype)
+```
+
+```{r fig.height=10, fig.width=10}
+# umap_bulk$cluster_plots1$scatter
+# umap_bulk$cluster_plots1$barplot
+```
+
+### Add in the Models to the UMAP Embedding
+
+```{r}
+umap_models <- uwot::umap_transform(t(as.matrix(in_vst[,newData$Sample])),
+                                    umap_bulk$umap_model,
+                                    verbose = TRUE)
+
+dim(umap_models)
+```
+
+```{r}
+umap_models.df <- read.csv("UMAP/TARGET_AML_sg6678_md0.01_nn35_UMAP_primary.fusion_bulk_CBFLGISmodel_samples_05.12.21.csv")
+
+# umap_models.df <- bind_cols(data.frame(umap_models, fix.empty.names=TRUE),
+#                             newData) %>% 
+#   rename_at(vars(X1:X3), ~c("x","y","z")) %>% 
+#   mutate(AML_Subtype=Comparisons) %>% 
+#   bind_rows(umap_bulk$umap_res) %>% 
+#   mutate(shape=case_when(
+#           grepl("Week6", AML_Subtype) ~ 22,
+#           grepl("Week12", AML_Subtype) ~ 24,
+#           grepl("CordBlood", AML_Subtype) ~ 21,
+#           TRUE ~ 19)) %>% 
+#   mutate(pt_size=case_when(
+#           # grepl("CBFGLIS_CordBlood", AML_Subtype) ~ 3,
+#           grepl("CBFA2T3-GLIS2", AML_Subtype) ~ 3,
+#           TRUE ~ 1.0)) %>% 
+#   mutate(Time_Point_Group=factor(Time_Point_Group, 
+#                                  levels=c("Week1","Week6","Week12"))) 
+#   # rename_at(vars(x,y,z), ~c("UMAP_1", "UMAP_2", "UMAP_3"))
+
+# head(umap_models.df)
+dim(umap_models.df)
+
+# write.csv(umap_models.df, "TARGET_AML_sg6678_md0.01_nn35_UMAP_primary.fusion_bulk_CBFLGISmodel_samples_05.12.21.csv", row.names = FALSE)
+
+
+# openxlsx::addWorksheet(supp_table,
+#                        sheetName = "UMAP Results")
+# openxlsx::writeData(supp_table,
+#                     sheet = "UMAP Results",
+#                     dplyr::select(umap_models.df, x:z, Sample, USI, AML_Subtype,Time_Point_Group,Tissue),
+#                     keepNA=FALSE,
+#                     rowNames=FALSE)
+```
+
+
+```{r}
+cc_newData <- cc
+cc_newData$AML_Subtype["EC_Week1_GFP_CordBlood"] <- "springgreen4"
+cc_newData$AML_Subtype["EC_Week1_CBFGLIS_CordBlood"] <- "blue2"
+cc_newData$AML_Subtype["EC_Week6_CBFGLIS_CordBlood"] <- "blue2"
+cc_newData$AML_Subtype["EC_Week12_CBFGLIS_CordBlood"] <- "blue2"
+
+cc_newData$AML_Subtype["Myeloid_Week1_GFP_CordBlood"] <- "orange"
+cc_newData$AML_Subtype["Myeloid_Week1_CBFGLIS_CordBlood"] <- "deeppink"
+cc_newData$AML_Subtype["Myeloid_Week6_CBFGLIS_CordBlood"] <- "deeppink"
+
+
+
+cc_newData[["AML_point_color"]] <- cc_newData$AML_Subtype
+cc_newData$AML_point_color[grep("CordBlood", names(cc_newData$AML_point_color))] <- "black"
+
+
+
+# cc_newData$AML_Subtype
+par(mar=c(10,5,5,5))
+barplot(rep(1,length(cc_newData$AML_Subtype)),col = cc_newData$AML_Subtype, names.arg = names(cc_newData$AML_Subtype), las=2)
+```
+
+
+```{r}
+umap_bulk_models <- umap_bulk
+umap_bulk_models$umap_res <- umap_models.df
+
+d3_models <- scatter_plots_3d(umap_workflow_res = umap_bulk_models, 
+                 Group_Column = "AML_Subtype", 
+                 Cols=c("Sample",Cols), 
+                 cc=cc_newData$AML_Subtype)
+
+d3_models
+# htmlwidgets::saveWidget(d3_models,"TARGET_AML_sg6678_md0.01_nn35_UMAP_primary.fusion_bulk_CBFLGISmodel_samples_05.12.21.html", background = "black")
+```
+
+```{r}
+# table(umap_models.df$AML_Subtype, umap_models.df$pt_size)
+
+# table()
+# table(umap_models.df$pt_size,
+#       umap_models.df$AML_Subtype)
+```
+
+The UMAP will be designed based on your example figure:
+bulk samples into these groups:
+0. NBM (light grey, < pt size)
+1.CBFB-MYH11 (light/pastel colors, < pt size)
+2. RUNX1-RUNX1T1 (light/pastel colors, < pt size)
+3. KMT2A (light/pastel colors, < pt size)
+4. Others  (light/pastel colors, < pt size)
+5. CBFGLIS (light purple, > pt size)
+*Labels will be placed next to these groups
+ 
+ 
+Then Models:
+EC_Week1_CBFGLIS_CordBlood (no outline, > pt size, blue )
+EC_Week6_CBFGLIS_CordBlood  (dashed outline, > pt size, blue )
+EC_Week12_CBFGLIS_CordBlood      (solid outine, > pt size, blue)
+Myeloid_Week1_CBFGLIS_CordBlood (no outline, > pt size, red )
+Myeloid_Week7_CBFGLIS_CordBlood    (dashed outline, > pt size, red)
+EC_Week1_GFP_CordBlood (no outline, < pt size, dark  green)
+MC_Week1_GFP_CordBlood (no outline, < pt size, green)
+ 
+ 
+
+```{r fig.height=6, fig.width=20}
+dims <- list(c("x","y"), c("x","z"), c("y", "z"))
+plots <- lapply(dims, make_umap_2d,umap_res.df=umap_models.df, colors_list=cc_newData)
+
+# pdf("UMAP/TARGET_AML_sg6678_md0.01_nn35_UMAP_primary.fusion_bulk_CBFLGISmodel_samples_06.11.21.pdf", height = 6, width = 20)
+grid.arrange(grobs=plots, ncol=3, widths=c(0.46, 0.31, 0.32))
+# dev.off()
+```
+
+
+### 3D Static
+ 
+```{r}
+# devtools::install_github("AckerDWM/gg3D")
+library(gg3D)
+library(cowplot)
+# library(svglite)
+```
+
+```{r fig.height=7, fig.width=10}
+# NOTE: Cannot do the standard 'hacky' way of subsetting your ggplot data and adding the group of interest a second layer, such as to make the points bigger or add stroke etc. 
+# 
+# Instead, use the whole dataset as input for a second layer for a group of interest. Change all unwanted color/fill values to NA. Then set the scale_XXX_disrete/scale_XXXX_manual with na.value=NA and/or with na.translate=FALSE to be transparent. Othersize the axes/rotation do not match up because a new min/max for x,y,z coors are used to draw the axes. 
+
+# theta=-120
+# phi=-10
+
+ggplot(umap_models.df, 
+       aes(x=x, y=y, z=z, fill=AML_Subtype)) + 
+  theme_void() +
+  axes_3D() +
+  stat_3D(geom="point", shape=21, size=umap_models.df$pt_size, phi=45, theta=15) +
+  scale_fill_manual(values=cc_newData$AML_Subtype)
+
+```
+
+
+
+## Example
+
+```{r}
+library(snedata)
+# snedata::download_mnist()
+# Add new points to an existing embedding
+mnist_train <- head(mnist, 60000)
+mnist_test <- tail(mnist, 10000)
+
+# You must set ret_model = TRUE to return extra data we need
+# coordinates are in mnist_train_umap$embedding
+mnist_train_umap <- umap(mnist_train, verbose = TRUE, ret_model = TRUE)
+mnist_test_umap <- umap_transform(mnist_test, mnist_train_umap, verbose = TRUE)
+```
+
+
+#Perform Differential Expression
+
+* pairwise for a few initial comparisions
+* CBFGLIS binding sites from ChIP-seq from Thomas Mercher
+
+
+
+
+### EC Co-Culture
+
+```{r}
+EC.comparisons <-  CBFGLIS_samples %>% #CBFGLIS.models %>% 
+  filter(!grepl("sort", Sample), !grepl("Week9", Time_Point_Group)) %>% 
+  filter(grepl("EC", Culture_condition)) %>% 
+  filter(grepl("GFP|CBFA2T3", Transduction_condition)) %>%
+  mutate(EC_Groups_GeneTargets=case_when(
+      grepl("EC_Week1_GFP", Comparisons) ~ "GFP", 
+      grepl("Week(6|12)_CBFGLIS", Comparisons) ~ "CBFGLIS")) %>% 
+  mutate(USI=Sample) %>% 
+  set_rownames(.$Sample)
+
+# table(EC.comparisons$Transduction_condition, EC.comparisons$Time_Point_Group)
+table(EC.comparisons$Comparisons)
+# table(EC.comparisons$EC_Groups_GeneTargets)
+# head(EC.comparisons[,1:5])
+```
+
+```{r}
+ids2symbols <- geneIDs %>% 
+  dplyr::select(gene_name, gene_id)
+
+dim(ids2symbols) #58263     2
+head(ids2symbols)
+dim(in_counts) #58263   182
+# write.csv(ids2symbols,"References/Gencode_v29_IDs_to_GeneSymbols.csv", row.names = F)
+```
+
+```{r}
+ref <- "GFP"
+conditions <- c("Week1","Week6", "Week12")
+cols.colorbar <- c("AML_Subtype", "Transduction_condition", "Culture_condition", "Time_Point_Group")
+
+DEGs.EC <- lapply(conditions,function(condition){
+  df <- filter(EC.comparisons, grepl(ref,Transduction_condition) | 
+         (grepl("GLIS",Transduction_condition) & Time_Point_Group == condition)) %>% 
+    set_rownames(.$Sample)
+  
+  DE <- twoGroups_DEGs(expnData = in_counts,
+                       clinData = df,
+                       col="Transduction_condition",
+                       ref = ref,
+                       ids2symbols = "References/Gencode_v29_IDs_to_GeneSymbols.csv",
+                       anno = FALSE,
+                       SkipPlots = TRUE,
+                       Custom.Cols = cols.colorbar)
+  
+})
+
+names(DEGs.EC) <- conditions
+# saveRDS(DEGs.EC, "DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_EC.culture_DEGs_5.21.21.RDS")
+```
+
+```{r}
+DEGs.EC <- readRDS("DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_EC.culture_DEGs_5.21.21.RDS")
+# DEGs.EC$Week1$phenovector
+# dim(DEGs.EC$Week1$DE$Voom$E) #19492     6
+# head(DEGs.EC$Week1$DE$eBayesFit$p.value[order(DEGs.EC$Week1$DE$eBayesFit$p.value)])
+
+# dir.create("DEGs/for_volcano_plots/")
+raw_res <- lapply(names(DEGs.EC[2:3]), function(x){
+  fit <- DEGs.EC[[x]]$DE$eBayesFit
+  df <- data.frame(gene=rownames(fit[["coefficients"]]),
+              log2FC=fit[["coefficients"]][,1],
+              p.value=fit[["p.value"]][,1]) %>% 
+    mutate(FDR=p.adjust(p.value, method = "BH")) %>% 
+    left_join(., select(geneIDmap, gene_name, gene_id),
+              by=c("gene"="gene_name")) %>% 
+    arrange(desc(log2FC), desc(FDR)) %>% 
+    select(gene, gene_id, everything())
+  
+  # filename <- paste0("DEGs/for_volcano_plots/TARGET_AML_CBFGLIS.model_", x, "_vs_GFP_EC.culture_DEGs_5.21.21.csv")
+  # con <- file(filename, open="wt")
+  # writeLines(paste("# Differentially expressed genes in CBFGLIS transduced cordblood compared to GFP transduced cordblood."), con)
+  # writeLines(paste("# Culture Condition: EC co-culture"), con)
+  # writeLines(paste("# Input Samples:", x, "CBFGLIS_Cordblood (N=4) vs  GFP_Cordblood Week1 (N=3)"), con)
+  # write.csv(df, con,row.names = F)
+  # close(con)
+})
+
+```
+
+```{r}
+# table(DEGs.EC$Week6$phenovector)
+DEGs.EC.week7 <- read.csv("DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_Week7_EC.culture_DEGs_5.21.21.csv", comment.char = "#")
+
+# DEGs.EC.week7 <- extract_DEGs(DEGs.EC$Week6) %>% 
+#   left_join(., ids2symbols, by=c("gene"="gene_name")) 
+
+head(DEGs.EC.week7)
+tail(DEGs.EC.week7)
+dim(DEGs.EC.week7) #4076    9
+
+# DEGs.EC.week7 %>% 
+#   filter(grepl("FOLR1", gene))
+
+
+# conWeek7 <- file("DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_Week7_EC.culture_DEGs_5.21.21.csv", open="wt")
+# writeLines(paste("# Differentially expressed genes in CBFGLIS transduced cordblood compared to GFP transduced cordblood."), conWeek7)
+# writeLines(paste("# Culture Condition: EC co-culture"), conWeek7)
+# writeLines(paste("# Input Samples: Week7 CBFGLIS_Cordblood (N=4) vs  GFP_Cordblood Week1 (N=3)"), conWeek7)
+# write.csv(DEGs.EC.week7, conWeek7, row.names = F)
+# close(conWeek7)
+
+
+# openxlsx::addWorksheet(supp_table,
+#                        sheetName = "CBFGLIS HSPCs DEGs EC week6")
+# openxlsx::writeData(supp_table,
+#                     sheet = "CBFGLIS HSPCs DEGs EC week6",
+#                     data.frame(), #blank so I can simply add in the table with the comments
+#                     keepNA=FALSE,
+#                     rowNames=FALSE)
+```
+
+```{r}
+DEGs.EC.week12 <- read.csv("DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_Week12_EC.culture_DEGs_5.21.21.csv",comment.char = "#")
+# DEGs.EC.week12 <- extract_DEGs(DEGs.EC$Week12) %>% 
+#   left_join(., ids2symbols, by=c("gene"="gene_name"))
+  # filter(grepl("^ENSG", gene_id))
+
+head(DEGs.EC.week12)
+dim(DEGs.EC.week12) #4083    9
+
+
+# DEGs.EC.week12 %>% 
+#   filter(grepl("FOLR1", gene))
+
+
+# conWeek12 <- file("DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_Week12_EC.culture_DEGs_5.21.21.csv", open="wt")
+# writeLines(paste("# Differentially expressed genes in CBFGLIS transduced cordblood compared to GFP transduced cordblood."), conWeek12)
+# writeLines(paste("# Culture Condition: EC co-culture"), conWeek12)
+# writeLines(paste("# Input Samples: Week12 CBFGLIS_Cordblood (N=4) vs  Week1 GFP_Cordblood (N=3)"), conWeek12)
+# write.csv(DEGs.EC.week12, conWeek12, row.names = F)
+# close(conWeek12)
+
+
+
+# openxlsx::addWorksheet(supp_table,
+#                        sheetName = "CBFGLIS HSPCs DEGs EC week12")
+# openxlsx::writeData(supp_table,
+#                     sheet = "CBFGLIS HSPCs DEGs EC week12",
+#                     data.frame(), #blank so I can simply add in the table with the comments
+#                     keepNA=FALSE,
+#                     rowNames=FALSE)
+```
+
+
+#### For Target genes 
+
+```{r}
+ref <- "GFP"
+conditions <- c("Week1","Week6", "Week12")
+cols.colorbar <- c("AML_Subtype", "Transduction_condition", "Culture_condition", "Time_Point_Group")
+
+forTargets <- twoGroups_DEGs(expnData = in_counts, 
+                       clinData = EC.comparisons[!is.na(EC.comparisons$EC_Groups_GeneTargets),],
+                       col="EC_Groups_GeneTargets", 
+                       ref = ref, 
+                       ids2symbols = "References/Gencode_v29_IDs_to_GeneSymbols.csv",
+                       anno = FALSE,
+                       SkipPlots = TRUE,
+                       Custom.Cols = cols.colorbar)
+
+dim(forTargets$DE$Voom$E) #19843    11
+# saveRDS(forTargets, "TARGET_AML_CBFGLIS.models_Week7and12_vs_GFP_week1_DEGs.RDS")
+```
+
+```{r}
+DE.forTargets <- extract_DEGs(forTargets) 
+  #   mutate(SialicAcidPathway=case_when(gene %in% sialicAcid$gene_name.stable.ID ~ "Yes")) %>%
+  #   mutate(Cell_Adhesion_Gene=ifelse(gene %in% unlist(GO.Adhesion), "Yes", NA)) %>%
+  #   mutate(CancerTestesAntigen_CTA=case_when(
+  #       gene %in% CTAs$Family.member ~ "CTA",
+  #   TRUE  ~ "")) %>% 
+  # dplyr::select(gene,SialicAcidPathway:CancerTestesAntigen_CTA,Treatment.type,everything())
+
+
+# con <- file("TARGET_AML_CBFGLIS.models_Week7and12_vs_GFP_week1_DEGs.csv", open="wt")
+# writeLines(paste("# Differentially expressed genes in CBFGLIS transduced cordblood compared to GFP transduced cordblood."), con)
+# writeLines(paste("# Culture Condition: EC co-culture"), con)
+# writeLines(paste("# Input Samples: Week7 and Week12 CBFGLIS_Cordblood (N=8) vs  GFP_Cordblood (N=3)"), con)
+# write.csv(DE.forTargets, con, row.names = FALSE)
+# close(con)
+
+head(DE.forTargets)
+# dim(DE.forTargets) #4048    8
+```
+
+```{r}
+forTargets$DE$Voom$E["FOLR1",]
+
+forTargets$DE$eBayesFit$coefficients["FOLR1",]
+FDR <- p.adjust(forTargets$DE$eBayesFit$p.value, method = "BH")
+names(FDR) <- rownames(forTargets$DE$eBayesFit$p.value)
+
+FDR["FOLR1"]
+```
+
+
+## Myeloid Culture
+
+```{r}
+MC.comparisons <- CBFGLIS_samples %>% 
+  filter(!grepl("scbulkleftovers|pool", Sample)) %>% 
+  filter(grepl("Myeloid", Culture_condition)) %>% 
+  filter(grepl("GFP|CBFA2T3", Transduction_condition)) %>% 
+  filter(!c(grepl("GFP", Transduction_condition) & grepl("Week12|Week6", Time_Point_Group))) %>% 
+  mutate(USI=Sample) %>% 
+  set_rownames(.$Sample)
+
+table(MC.comparisons$Transduction_condition, MC.comparisons$Time_Point_Group)
+
+table(MC.comparisons$Comparisons)
+# View(MC.comparisons)
+```
+
+```{r}
+ref <- "GFP"
+conditions <- c("Week1","Week6", "Week12")
+cols.colorbar <- c("AML_Subtype", "Transduction_condition", "Culture_condition", "Time_Point_Group")
+```
+
+```{r}
+DEGs.MC <- lapply(conditions,function(condition){
+  df <- filter(MC.comparisons, grepl(ref,Transduction_condition) | 
+         (grepl("GLIS",Transduction_condition) & Time_Point_Group == condition)) %>% 
+    set_rownames(.$Sample)
+  
+  DE <- twoGroups_DEGs(expnData = in_counts,
+                       clinData = df,
+                       col="Transduction_condition",
+                       ref = ref,
+                       ids2symbols = "References/Gencode_v29_IDs_to_GeneSymbols.csv",
+                       anno = FALSE,
+                       SkipPlots = TRUE,
+                       Custom.Cols = cols.colorbar)
+
+})
+
+names(DEGs.MC) <- conditions
+# saveRDS(DEGs.MC, "DEGs/00_Archive/TARGET_AML_CBFGLIS.model_vs_GFP_MC.culture_DEGs.RDS")
+```
+
+```{r}
+DEGs.MC <- readRDS("DEGs/00_Archive/TARGET_AML_CBFGLIS.model_vs_GFP_MC.culture_DEGs.RDS")
+DEGs.MC$Week1$phenovector
+dim(DEGs.MC$Week1$DE$Voom$E) #18603     6
+# head(DEGs.MC$Week1$DE$eBayesFit$p.value[])
+```
+
+```{r}
+DEGs.MC.week7  <- read.csv("DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_Week7_MC.culture_DEGs_5.21.21.csv", comment.char = "#")
+
+# dim(DEGs.MC$Week7$DE$Voom$E) 18830     6
+# DEGs.MC.week7 <- extract_DEGs(DEGs.MC$Week6) %>% 
+#   left_join(., ids2symbols, by=c("gene"="gene_name"))
+  # filter(grepl("^ENSG", gene_id))
+
+head(DEGs.MC.week7)
+dim(DEGs.MC.week7) #3797    8
+
+
+
+# conWeek7MC <- file("DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_Week7_MC.culture_DEGs_5.21.21.csv", open="wt")
+# writeLines(paste("# Differentially expressed genes in CBFGLIS transduced cordblood compared to GFP transduced cordblood."), conWeek7MC)
+# writeLines(paste("# Culture Condition: Myeloid culture"), conWeek7MC)
+# writeLines(paste("# Input Samples: Week7 CBFGLIS_Cordblood (N=3) vs  Week1 GFP_Cordblood (N=3)"), conWeek7MC)
+# write.csv(DEGs.MC.week7, conWeek7MC, row.names = F)
+# close(conWeek7MC)
+
+
+
+# openxlsx::addWorksheet(supp_table,
+#                        sheetName = "CBFGLIS HSPCs DEGs MC week6")
+# openxlsx::writeData(supp_table,
+#                     sheet = "CBFGLIS HSPCs DEGs MC week6",
+#                     data.frame(), #blank so I can simply add in the table with the comments
+#                     keepNA=FALSE,
+#                     rowNames=FALSE)
+```
+
+```{r}
+DEGs.MC.week12 <- read.csv("DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_Week12_MC.culture_DEGs_5.21.21.csv", comment.char = "#")
+
+# DEGs.MC.week12 <- extract_DEGs(DEGs.MC$Week12) %>% 
+#   left_join(., ids2symbols, by=c("gene"="gene_name"))
+
+head(DEGs.MC.week12)
+dim(DEGs.MC.week12) #2055    8
+
+
+# conWeek12MC <- file("DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_Week12_MC.culture_DEGs_5.21.21.csv", open="wt")
+# writeLines(paste("# Differentially expressed genes in CBFGLIS transduced cordblood compared to GFP transduced cordblood."), conWeek12MC)
+# writeLines(paste("# Culture Condition: Myeloid culture"), conWeek12MC)
+# writeLines(paste("# Input Samples: Week12 CBFGLIS_Cordblood (N=3) vs  Week1 GFP_Cordblood (N=3)"), conWeek12MC)
+# write.csv(DEGs.MC.week12, conWeek12MC, row.names = F)
+# close(conWeek12MC)
+
+
+
+
+# openxlsx::addWorksheet(supp_table,
+#                        sheetName = "CBFGLIS HSPCs DEGs MC week12")
+# openxlsx::writeData(supp_table,
+#                     sheet = "CBFGLIS HSPCs DEGs MC week12",
+#                     data.frame(), #blank so I can simply add in the table with the comments
+#                     keepNA=FALSE,
+#                     rowNames=FALSE)
+```
+
+
+# DEGs in Models and Patients
+
+```{r}
+# CBFGLISvsAML$gene_name
+```
+
+```{r}
+DEGs.list <- lapply(c(DEGs.EC[-1], DEGs.MC[-1]), function(x) extract_DEGs(x)) 
+names(DEGs.list) <- paste0(rep(c("EC_","MC_"), each=2), names(DEGs.list))
+
+length(DEGs.list)
+names(DEGs.list)
+
+n.common <- sapply(DEGs.list, function(x) length(intersect(pull(x, gene), CBFGLISvsAML$gene_name)))
+```
+
+```{r}
+degs.common <- data.frame(Culture_Condition=rep(c("EC","MC"), each=3),
+                          Time_Point=rep(paste("Week",c(1,7,12)))) %>% 
+  mutate(Comparison=rep(paste(rep("GFP_CordBlood", 3), "x", 
+                              paste("CBFGLIS_CordBlood")),2), 
+         Number_DEGs=c(0,nrow(DEGs.list$EC_Week7), nrow(DEGs.list$EC_Week12), 
+                       0, nrow(DEGs.list$MC_Week7), nrow(DEGs.list$MC_Week12)), 
+         Number_Shared_DEGs=c(0, n.common[1:2], 
+                              0, n.common[3:4]), 
+         Percent_Shared_DEGs=round((Number_Shared_DEGs/Number_DEGs)*100, digits = 2))
+
+
+# degs.common
+# write.csv(degs.common, "TARGET_AML_CBFGLIS.models_DEGs_Summary_Table_5.21.21.csv", row.names = F)
+```
+
+
+
+
+
+# Expression plots Genes of Interest
+
+```{r}
+library(ggbeeswarm)
+library(patchwork)
+```
+
+```{r}
+simple_boxplot <- function(df){
+  box <- ggplot(df, 
+                  aes(x=Comparisons, y=log2CPM, fill=Comparisons, color=Comparisons)) +
+  geom_jitter() +
+  geom_boxplot(alpha=0.6, color="black") +
+  facet_wrap(~gene) +
+  scale_fill_brewer(palette = "Paired") +
+    scale_color_brewer(palette = "Paired") +
+  labs(x="",y="Expression (log2 CPM)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1, size=10),
+        panel.border = element_rect(color="black", fill=NA),
+        plot.margin = margin(l=15, unit="mm"),
+        strip.text = element_text(size=14),
+        legend.text = element_text(size=14))
+  
+  return(box)
+}
+```
+
+```{r}
+# filter(geneIDmap, grepl("^KIT$|^ERG$|GATA1$", gene_name))
+```
+
+```{r}
+samps_for_violin <- CBFGLIS_samples %>% 
+  filter(!grepl("pool|sort|pos|D63.EC", Sample),
+         !c(grepl("replicate", Sample) & Group=="NBM"),
+         !grepl("mock",Sample)) %>% 
+  filter(!grepl("(Week6|Week12)_GFP|CD34_PB", Comparisons)) %>% 
+  mutate_at(vars(Comparisons), ~factor(.,  levels=c(
+                                                    # "CD34_PB",
+                                                    "EC_Week1_GFP_CordBlood",
+                                                    "EC_Week1_CBFGLIS_CordBlood",
+                                                    "EC_Week6_CBFGLIS_CordBlood",
+                                                    "EC_Week12_CBFGLIS_CordBlood", 
+                                                    "Myeloid_Week1_GFP_CordBlood", 
+                                                    "Myeloid_Week1_CBFGLIS_CordBlood", 
+                                                    "Myeloid_Week6_CBFGLIS_CordBlood",
+                                                    "Myeloid_Week12_CBFGLIS_CordBlood",
+                                                    "CBFA2T3-GLIS2",
+                                                    "NBM"))) %>% 
+  filter(!grepl("Myeloid_Week12_CBFGLIS_CordBlood", Comparisons)) %>% 
+  droplevels() %>% 
+  mutate(Facet=factor(ifelse(grepl("CD34_PB|NBM|CBFA2T3-GLIS2",Comparisons), "Primary Samples", "CBFA2T3-GLIS2 HSPCs"), 
+                        levels=c("Primary Samples","CBFA2T3-GLIS2 HSPCs")))
+  
+
+table(samps_for_violin$Comparisons, useNA='ifany')
+table(samps_for_violin$Facet, useNA='ifany')
+# table(samps_for_violin$Culture_condition, useNA='ifany')
+# unique(samps_for_violin$Comparisons[order(samps_for_violin$Comparisons)])
+```
+
+```{r}
+genes.of.interest <- CPM[grep("^ERG$|GATA1$|^BMP2$|^BMP4$|^WT1$", rownames(CPM)), samps_for_violin$Sample] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("gene") %>% 
+  gather(Sample, CPM, -gene) %>% 
+  mutate(log2CPM=log2(CPM+1)) %>% 
+  left_join(., samps_for_violin, by="Sample")  %>% 
+  mutate(gene=factor(gene, levels=c("ERG","BMP2","BMP4","GATA1","WT1"))) %>% 
+  mutate(Size=ifelse(Facet=="Primary Samples", 0.5, 2.0)) %>% 
+  arrange(gene)
+
+
+head(genes.of.interest)
+# dim(genes.of.interest)
+# table(genes.of.interest$Comparisons, useNA='ifany')
+# table(genes.of.interest$Size, genes.of.interest$Comparisons)
+
+
+# openxlsx::addWorksheet(supp_table,
+#                        sheetName = "CBFA2T3-GLIS2 Associated Genes")
+# openxlsx::writeData(supp_table,
+#                     sheet = "CBFA2T3-GLIS2 Associated Genes",
+#                     dplyr::select(genes.of.interest, Sample, USI, gene, CPM,
+#                                   AML_Subtype=Comparisons,Time_Point_Group,Tissue),
+#                     keepNA=FALSE,
+#                     rowNames=FALSE)
+```
+
+```{r}
+cc.cultures <- c(
+                 "EC_Week1_GFP_CordBlood"="springgreen4",
+                 "EC_Week1_CBFGLIS_CordBlood"="blue2",
+                 "EC_Week6_CBFGLIS_CordBlood"="blue2",
+                 "EC_Week12_CBFGLIS_CordBlood"="blue2", 
+                 "Myeloid_Week1_GFP_CordBlood"="orange2", 
+                 "Myeloid_Week1_CBFGLIS_CordBlood"="deeppink", 
+                 "Myeloid_Week6_CBFGLIS_CordBlood"="deeppink",
+                 "CBFA2T3-GLIS2"="mediumorchid2",
+                 "NBM"="black")
+```
+
+```{r fig.height=6, fig.width=30}
+breaks_list <- list("GATA1"=c(0,15,30,45),
+                    "BMP2"=c(0,20,40,60),
+                    "BMP4"=c(0,5,10,15),
+                    "ERG"=c(0,60,120, 180))
+breaks_list <- breaks_list[levels(genes.of.interest$gene)]
+
+boxplots <- lapply(as.character(unique(genes.of.interest$gene)), function(x){
+
+  
+  make_facet_boxplots(genes.of.interest = droplevels(genes.of.interest[genes.of.interest$gene==x,]),
+                      breaks=breaks_list[[x]])
+})
+
+# boxplots
+
+# pdf("Figures/Boxplots/TARGET_AML_CBFGLIS.models_CBFGLIS.patients_GATA1_BMP2_BMP4_ERG_Expression_boxplots.pdf", height=6, width = 30)
+gridExtra::grid.arrange(grobs=boxplots, nrow=1)
+# dev.off()
+```
+
+```{r fig.width=15, fig.height=6}
+my_comparisons <- list(c("EC_Week1_GFP_CordBlood", "EC_Week1_CBFGLIS_CordBlood"),
+                       c("EC_Week1_GFP_CordBlood", "EC_Week6_CBFGLIS_CordBlood"),
+                       c("EC_Week1_GFP_CordBlood", "EC_Week12_CBFGLIS_CordBlood"),
+                       c("Myeloid_Week1_GFP_CordBlood", "Myeloid_Week1_CBFGLIS_CordBlood"),
+                       c("Myeloid_Week1_GFP_CordBlood", "Myeloid_Week6_CBFGLIS_CordBlood"),
+                       c("NBM","CBFA2T3-GLIS2"))
+
+
+# ggplot(data=genes.of.interest, aes(x=Comparisons, y=CPM, fill=Comparisons)) +
+#       geom_boxplot(alpha=0.2,outlier.shape = NA,  inherit.aes = TRUE)  +
+#   stat_compare_means(comparisons = my_comparisons, method="wilcox.test", 
+#                      method.args = list(alternative="two.sided"), 
+#                      label="p.signif") + #"p.signif"
+#   facet_wrap(~gene) +
+#   theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1))
+```
+
+
+
+
+```{r}
+DEGs.list.objs <- ls(pattern = "DEGs.EC|DEGs.MC")
+DEGs.list <- lapply(DEGs.list.objs, function(x) get(x))
+names(DEGs.list) <- DEGs.list.objs
+
+# sapply(DEGs.list, dim)
+
+DEGs.GOI.df <- lapply(names(DEGs.list), function(x) filter(DEGs.list[[x]], grepl("^ERG$|GATA1$|^BMP2$", gene)) %>% 
+         dplyr::select(gene, logFC, adj.P.Val) %>% 
+         mutate(Culture=str_split_fixed(x, pattern="\\.", n=3)[,2],
+                Time_Point=gsub("7", "6", str_split_fixed(x, pattern="\\.", n=3)[,3]),
+                Comparison="vs GFP Week1")) %>% 
+  bind_rows() %>% 
+  mutate(adj.P.Val=round(adj.P.Val, digits = 3)) %>% 
+  mutate(Signif_level=case_when(
+                  adj.P.Val > 0.05 ~ "n.s.",
+                  adj.P.Val <= 0.0001 ~ "****",
+                  adj.P.Val <= 0.001 ~ "***",
+                  adj.P.Val <= 0.01 ~ "**",
+                  adj.P.Val < 0.05 ~ "*",
+                )) %>% 
+  arrange(gene, desc(Time_Point))
+
+DEGs.GOI.df
+# write.csv(DEGs.GOI.df, "DEGs/TARGET_AML_GenesOfInterest_DEGs.csv", row.names = FALSE)
+```
+
+
+```{r fig.width=10}
+EC.box.WT1 <- simple_boxplot(df=filter(genes.of.interest,grepl("WT1", gene))) +
+  theme(plot.margin = margin(l=3, unit="cm")) +
+  stat_compare_means(comparisons = my_comparisons, method.args = list(alternative="less"), label="p.format")
+
+EC.box.WT1
+# ggsave(plot = EC.box.WT1, filename = "Figures/TARGET_AML_CBFGLIS.models_and_Patients_and_NBM_WT1_Expression.pdf", device = "pdf", height = 7, width = 10)
+```
+
+
+```{r fig.height=5, fig.width=15}
+EC.box1 <- simple_boxplot(df=filter(genes.of.interest,grepl("GLIS2|EC", Culture_condition)))
+EC.box2 <- simple_boxplot(df=filter(genes.of.interest,grepl("GLIS2|EC|NBM|PB", Culture_condition)))
+EC.box3 <- simple_boxplot(df=filter(genes.of.interest,grepl("GLIS2|EC", Culture_condition),
+                                    !grepl("Week1_CBFGLIS", Comparisons)))
+
+# pdf("Figures/TARGET_AML_CBFGLISpts_CBFGLIS.models_EC_Boxplot.pdf", height = 5, width = 15)
+# EC.box1
+# dev.off()
+
+
+# pdf("Figures/TARGET_AML_CBFGLISpts_CBFGLIS.models_NBM_EC_Boxplot.pdf", height = 5, width = 15)
+# EC.box2
+# dev.off()
+# 
+# 
+# pdf("Figures/TARGET_AML_CBFGLISpts_CBFGLIS.models_LateCultures_EC_Boxplot.pdf", height = 5, width = 15)
+# EC.box3
+# dev.off()
+
+```
+
+```{r fig.height=5, fig.width=15}
+MC.box1 <- simple_boxplot(df=filter(genes.of.interest,grepl("GLIS2|My", Culture_condition)))
+MC.box2 <- simple_boxplot(df=filter(genes.of.interest,grepl("GLIS2|My|NBM|PB", Culture_condition)))
+MC.box3 <- simple_boxplot(df=filter(genes.of.interest,grepl("GLIS2|My", Culture_condition), 
+                                    !grepl("Week1_CBFGLIS", Comparisons)))
+
+# pdf("Figures/TARGET_AML_CBFGLISpts_CBFGLIS.models_MC_Boxplot.pdf", height = 5, width = 15)
+# MC.box1
+# dev.off()
+
+# pdf("Figures/TARGET_AML_CBFGLISpts_CBFGLIS.models_NBM_MC_Boxplot.pdf", height = 5, width = 15)
+# MC.box2
+# dev.off()
+# 
+# 
+# pdf("Figures/TARGET_AML_CBFGLISpts_CBFGLIS.models_LateCultures_MC_Boxplot.pdf", height = 5, width = 15)
+# MC.box3
+# dev.off()
+
+```
+
+
+
+
+
+# Comparison of Time Points 
+
+```{r}
+models.subset <- bind_rows(EC.comparisons, MC.comparisons) %>% 
+  set_rownames(.$Sample) %>% 
+  mutate_at(vars(Comparisons), ~factor(., levels=c(  "EC_Week1_GFP_CordBlood",
+                                                    "EC_Week1_CBFGLIS_CordBlood",
+                                                    "EC_Week6_CBFGLIS_CordBlood",
+                                                    "EC_Week12_CBFGLIS_CordBlood",
+                                                    "Myeloid_Week1_GFP_CordBlood",
+                                                    "Myeloid_Week1_CBFGLIS_CordBlood",
+                                                    "Myeloid_Week6_CBFGLIS_CordBlood"))) %>%
+  filter(!is.na(Comparisons)) %>%  #these are myeloid week 12
+  arrange(Comparisons) %>% 
+  set_rownames(.$Sample)
+  # arrange("Culture_condition","Transduction_condition","Time_Point_Group")
+
+dim(models.subset)
+table(models.subset$Comparisons)
+
+```
+
+```{r}
+model_counts <- in_counts[,models.subset$Sample]
+keep.mod <- rowSums(cpm(model_counts) >= 1) >= 2
+cts.mod <- model_counts[keep.mod, ]
+
+dge.mod <- DGEList(counts=cts.mod)
+dge.mod <- calcNormFactors(dge.mod,method = "TMMwsp")
+
+logCPM.mod <- edgeR::cpm(dge.mod,log=TRUE,normalized.lib.sizes=TRUE, prior.count=1)
+CPM.mod <- edgeR::cpm(dge.mod,log=FALSE,normalized.lib.sizes=TRUE, prior.count=1)
+
+dim(logCPM.mod) #21626    23
+head(logCPM.mod[,1:5])
+```
+
+```{r}
+genes <- lapply(c(DEGs.EC[-1], DEGs.MC[-c(1,3)]),
+                function(x) extract_DEGs(x) %>% filter(abs(logFC) > 2) %>%  pull(gene)) %>% 
+  unlist() %>% 
+  unique()
+
+
+table(genes %in% rownames(logCPM.mod))
+length(genes) #3,408 genes with FC>4
+```
+
+
+```{r fig.height=7, fig.width=12}
+len <- 299
+col <- colorRampPalette(c("deepskyblue4", "deepskyblue3", "deepskyblue2", "deepskyblue1","white","red1", "red2", "red3", "red4"))(n=len)
+
+# pdf("TARGET_AML_CBFGLIS.models_vs_GFP.cordblood_DEGs_FC.GT.4_Heatmap_7.23.21.pdf", height = 7, width = 12)
+p <- pheatmap::pheatmap(mat= t(logCPM.mod[genes,]),
+                     color=col,
+                     scale = "column",
+                     # breaks = Breaks,
+                     cluster_rows=FALSE,
+                     cluster_cols = TRUE,
+                     clustering_method="ward.D2",
+                     clustering_distance_cols="euclidean",
+                     annotation_names_col=TRUE,
+                     annotation_row = models.subset[,c("Culture_condition",
+                                                       "Transduction_condition", 
+                                                       "Time_Point_Group")],
+                     # kmeans_k=2,
+                     annotation_colors=list("Culture_condition"=c("EC"="navy","Myeloid"="blue1"),
+                                            "Transduction_condition"=c("GFP"="grey","CBFA2T3_GLIS"="red4"), 
+                                            "Time_Point_Group"=c("Week1"="pink1","Week6"="pink3", "Week12"="pink4")),
+                     gaps_row=c(14),
+                     fontsize = 10,
+                     fontsize_row=10,
+                     fontsize_col=10,
+                     show_colnames=FALSE,
+                     show_rownames = F)
+# dev.off()
+```
+
+
+```{r}
+#https://rdrr.io/cran/pheatmap/src/R/pheatmap.r 
+scale_rows = function(x){
+    m = apply(x, 1, mean, na.rm = T)
+    s = apply(x, 1, sd, na.rm = T)
+    return((x - m) / s)
+}
+
+scale_mat = function(mat, scale){
+    if(!(scale %in% c("none", "row", "column"))){
+        stop("scale argument shoud take values: 'none', 'row' or 'column'")
+    }
+    mat = switch(scale, none = mat, row = scale_rows(mat), column = t(scale_rows(t(mat))))
+    return(mat)
+}
+
+pheatmap.zscores <- scale_mat(mat=t(logCPM.mod[genes,]), scale="column")
+dim(pheatmap.zscores)
+# head(pheatmap.zscores[,1:5])
+
+# openxlsx::addWorksheet(supp_table,
+#                        sheetName = "CBFGLIS HSPCs Heatmap Z-scores")
+# openxlsx::writeData(supp_table,
+#                     sheet = "CBFGLIS HSPCs Heatmap Z-scores",
+#                     pheatmap.zscores,
+#                     keepNA=FALSE,
+#                     rowNames=TRUE)
+```
+
+
+# Comparison to CBFGLIS Patient Samples
+
+```{r}
+models.subset <- bind_rows(EC.comparisons, MC.comparisons) %>% 
+  set_rownames(.$Sample)
+
+dim(models.subset)
+table(models.subset$Comparisons)
+```
+
+```{r}
+CBFGLIS.subset <- models.subset %>% 
+  bind_rows(., filter(CBFGLIS_samples, AML_Subtype=="CBFA2T3-GLIS2")) %>% 
+  mutate_all(~gsub("CBFA2T3-GLIS2","CBFA2T3.GLIS2", .)) %>% 
+  mutate(Comparisons=paste(Culture_condition, Time_Point_Group, AML_Subtype, sep="_")) %>% 
+  mutate(Comparisons=gsub("^(CBFA2T3.GLIS2)_.+", "\\1", Comparisons)) 
+
+dim(CBFGLIS.subset) #63 63
+# table(CBFGLIS.subset$Time_Point_Group)
+table(CBFGLIS.subset$Comparisons)
+```
+
+```{r}
+CBFGLIS_counts <- in_counts[,CBFGLIS.subset$Sample]
+keep.cbf <- rowSums(CBFGLIS_counts) >= 5
+cts.cbf <- CBFGLIS_counts[keep.cbf, ]
+
+dge.cbf <- DGEList(counts=cts.cbf)
+dge.cbf <- calcNormFactors(dge.cbf,method = "TMMwsp")
+
+logCPM.cbf <- edgeR::cpm(dge.cbf,log=TRUE,normalized.lib.sizes=TRUE, prior.count=1)
+CPM.cbf <- edgeR::cpm(dge.cbf,log=FALSE,normalized.lib.sizes=TRUE, prior.count=1)
+
+dim(logCPM.cbf) #48478    66
+head(logCPM.cbf[,1:5])
+```
+
+```{r}
+#So likely due to the fact that CBFGLISvsAML had a huge referecne group of samples (>1,000) a lot more genes met the typical 1CPM cut-off. But to avoid excluding as many DE genes as possible, I lowered the CPM threshold to just 5 counts per row... Still missing 2 genes... 
+table(CBFGLISvsAML$gene_name %in% rownames(logCPM.cbf))
+
+CBFGLISvsAML$gene_name[!CBFGLISvsAML$gene_name %in% rownames(logCPM.cbf)]
+```
+
+```{r}
+genes <- lapply(c(DEGs.EC[-1], DEGs.MC[-1]), function(x) extract_DEGs(x) %>%  pull(gene)) 
+names(genes) <- paste0(rep(c("EC_","MC_"), each=2), names(genes))
+genes.all <-  c(list("EC_Week1_GFP"=CBFGLISvsAML$gene_name,"EC_Week1"=CBFGLISvsAML$gene_name), genes[1:2],
+                list("MC_Week1_GFP"=CBFGLISvsAML$gene_name,"MC_Week1"=CBFGLISvsAML$gene_name), genes[3:4])
+ 
+sapply(genes.all, length)
+
+in.degs <- lapply(genes.all, function(x) intersect(CBFGLISvsAML$gene_name, x))
+in.degs <- lapply(in.degs, function(x) intersect(rownames(logCPM.cbf), x))
+names(in.degs) <- names(genes.all)
+sapply(in.degs, length)
+
+# length(in.degs) #8 
+```
+
+```{r}
+grps <- unique(CBFGLIS.subset$Comparisons)
+# length(grps) #9
+# cbind(names(in.degs), grps[-9]) #Matches Order
+```
+
+```{r}
+scatter_plots <- lapply(1:8, function(i){
+  
+    comp1 <- CBFGLIS.subset %>% 
+        filter(grepl("CBFA2T3.GLIS2", AML_Subtype) | grepl(grps[i],Comparisons))
+    degs <- in.degs[[i]]
+    cols <- c("CBFA2T3.GLIS2",grps[i])
+    print(cols)
+    
+    plot <- scatter_comparison(df=comp1, cols=cols, genes=degs)
+    return(plot)
+})
+```
+
+```{r fig.height=15, fig.width=15}
+grid.arrange(grobs=scatter_plots, ncol=2)
+```
+
+
+
+
+# GSEA
+
+
+### GAGE Resutls
+
+```{r}
+library(gageData)
+library(gage)
+
+data(egSymb)
+data(sigmet.idx.hs)
+data(kegg.sets.hs)
+kegg.all <- kegg.sets.hs[sigmet.idx.hs]
+kegg.all.sym <- lapply(kegg.all, eg2sym)
+
+length(kegg.all.sym)
+grep("hedge|wnt|tgf", ignore.case = T,names(kegg.all.sym), value=TRUE)
+```
+
+```{r}
+gage_res_EC <- lapply(DEGs.EC[c("Week6","Week12")], gage_from_pipeline, type="expn",geneset=NULL)
+names(gage_res_EC) <- c("Week6","Week12")
+```
+
+```{r}
+dim(gage_res_EC$Week6$SigPaths.Up)
+dim(gage_res_EC$Week6$SigPaths.Dn)
+```
+
+```{r}
+save_res <- lapply(names(gage_res_EC), function(x){
+  dat <- gage_res_EC[[x]]
+  
+  for (direction in c("SigPaths.Up", "SigPaths.Dn")){
+      fname <- paste("GSEA/TARGET_AML_CBFGLIS.model_vs_GFP_EC", x, direction,"gage_GSEA.csv", sep="_")
+      print(fname)
+     
+      gsea_paths <-  dat[[direction]] %>% 
+        as.data.frame() %>% 
+        rownames_to_column("pathway") 
+      
+      con <- file(fname, open="wt")
+      writeLines(paste("# Differentially expressed pathways in CBFGLIS transduced cordblood compared to GFP transduced cordblood."), con)
+      writeLines(paste("# Culture Condition: EC co-culture"), con)
+      writeLines(paste("# Input Samples:", x, "CBFGLIS_Cordblood (N=4) vs  GFP_Cordblood Week1 (N=3)\n"), con)
+      
+      write.csv(gsea_paths, con, row.names = FALSE)
+      close(con)
+  }
+  
+})
+```
+
+
+
+
+
+### PathfindR Results
+
+```{r}
+library(pathfindR)
+```
+
+```{r}
+# res_for_gsea <- lapply(c(DEGs.EC[-1], DEGs.MC[-1]), function(x) extract_DEGs(x) %>%  
+#                          dplyr::select(gene, logFC, adj.P.Val)) 
+res_for_gsea <- lapply(ls(pattern="DEGs.[EM]"), function(x) get(x) %>%  
+                         dplyr::select(gene, logFC, adj.P.Val)) 
+
+# names(res_for_gsea) <- paste0(rep(c("EC_","MC_"), each=2), names(res_for_gsea))
+names(res_for_gsea) <- ls(pattern="DEGs.[EM]")
+names(res_for_gsea)
+```
+
+Error in grid.Call(C_stringMetric, as.graphicsAnnot(x$label)) : 
+  rsession: unable to read font `helvetica' @ error/annotate.c/RenderFreetype/1384
+  
+```{r}
+gsea <- lapply(1:length(res_for_gsea), function(i){
+  res <- run_pathfindR(input=res_for_gsea[[i]], 
+              gene_sets = "KEGG", 
+              min_gset_size = 15,
+              max_gset_size = 400,
+              visualize_enriched_terms=FALSE)
+  
+  # saveRDS(res, paste0("CBFGLIS.model_", names(res_for_gsea)[i], "_vs_GFP.cordblood_GSEA.RDS"))
+})
+
+names(gsea) <- names(res_for_gsea)
+```
+
+The p-value is derived from a re-sampling/permutation method, thus the lowest_p and highest_p
+so that will change from run-to-run, so not the most ideal for getting identical results/reproducibility.
+
+```{r}
+head(gsea$DEGs.EC.week7)
+# dim(gsea$DEGs.EC.week7) #146   8
+# setdiff(gsea$DEGs.EC.week7$ID, res.rdata$EC_Week7$ID)
+# setdiff(res.rdata$EC_Week7$ID, gsea$DEGs.EC.week7$ID)
+```
+
+```{r}
+head(res.rdata$EC_Week7)
+# dim(res.rdata$EC_Week7) #151   8
+
+res.rdata$EC_Week7 %>% 
+  filter(ID %in% setdiff(ID, gsea$DEGs.EC.week7$ID))
+```
+
+```{r}
+res.paths.rdata <- dir(path = "GSEA",pattern="*.RDS", full.names = TRUE)
+# res.paths.rdata 
+
+res.rdata <- lapply(res.paths.rdata, readRDS)
+names(res.rdata) <- gsub("^.+([EM].+[72])_.+", "\\1", res.paths.rdata)
+
+res.rdata.fdr <- lapply(res.rdata, function(x){
+  x %>% 
+    mutate(FDR=p.adjust(lowest_p, method = "BH")) %>% 
+    select(ID:Term_Description, FDR, everything())
+})
+
+
+# lapply(res.rdata.fdr, head)
+# lapply(res.rdata.fdr, dim)
+```
+
+```{r}
+# saved <- lapply(names(res.rdata), function(x){
+#  file <- gsub(".RDS",".csv", res.paths.rdata[grep(x, res.paths.rdata)])
+#  write.csv(res.rdata[[x]], file = file, row.names = FALSE)
+# })
+```
+
+```{r}
+paths_of_interest <- lapply(names(res.rdata), function(x){
+  
+  comp <- gsub("7","6",x) %>% 
+    str_split(.,"_") %>% 
+    unlist() 
+  
+  comp <- paste0(comp[1], "_CBFGLIS_", comp[2],"_vs_GFP_Week1")
+
+  res.rdata[[x]] %>%
+    filter(grepl("Hedge|TGF-beta|Wnt", Term_Description, ignore.case = TRUE)) %>%
+    mutate(Comparison=comp) %>%
+    select(Comparison, everything())
+  
+}) %>%
+  bind_rows()
+
+paths_of_interest
+
+# write.csv(paths_of_interest, "GSEA/TARGET_AML_CBFGLIS.model_HH_WNT_TGFB_enrichment_GSEA.csv", row.names = FALSE)
+```
+
+
+### Heatmaps 
+
+```{r}
+library(gageData)
+library(gage)
+
+data(egSymb)
+data(sigmet.idx.hs)
+data(kegg.sets.hs)
+kegg.all <- kegg.sets.hs[sigmet.idx.hs]
+kegg.all.sym <- lapply(kegg.all, eg2sym)
+
+# names(kegg.all.sym)
+# kegg.all.sym$`hsa00232 Caffeine metabolism`
+```
+
+```{r}
+heatmap.samps <- CBFGLIS_samples %>% 
+  filter(!grepl("pool", Sample)) %>% 
+  #CD34_PB|CBFA2T3|NBM
+  filter(grepl("EC_Week1_GFP|EC_Week(1|6|12)_CBFGLIS|Myeloid_Week1_GFP|Myeloid_Week(1|6)_CBFGLIS",
+               Comparisons)) %>% 
+  #"CD34_PB", "NBM","CBFA2T3-GLIS2",
+  mutate(Comparisons=factor(Comparisons, levels=c(
+                                                    "EC_Week1_GFP_CordBlood","EC_Week1_CBFGLIS_CordBlood",
+                                                    "EC_Week6_CBFGLIS_CordBlood","EC_Week12_CBFGLIS_CordBlood",
+                                                    "Myeloid_Week1_GFP_CordBlood", "Myeloid_Week1_CBFGLIS_CordBlood",
+                                                    "Myeloid_Week6_CBFGLIS_CordBlood"))) %>%
+  arrange(desc(Comparisons)) %>%
+  set_rownames(.$Sample)
+  
+table(heatmap.samps$Comparisons)
+# head(heatmap.samps)
+# dim(heatmap.samps)
+# cc_heatmaps <- colorCodes_aheatmap(df=select(heatmap.samps,all_of(Cols)))
+# cc_heatmaps
+```
+
+```{r}
+paths.to.use <- kegg.all.sym[grep("Hedge|TGF-beta|Wnt", names(kegg.all.sym))]
+
+#Clean up the HH pathway
+uniq.HH <- setdiff(paths.to.use$`hsa04340 Hedgehog signaling pathway`, paths.to.use$`hsa04310 Wnt signaling pathway`) %>% 
+  setdiff(., paths.to.use$`hsa04350 TGF-beta signaling pathway`) %>% 
+  grep("CSNK", ., value=TRUE, invert = TRUE)
+paths.to.use$`hsa04340 Hedgehog signaling pathway` <- paths.to.use$`hsa04340 Hedgehog signaling pathway`[paths.to.use$`hsa04340 Hedgehog signaling pathway` %in% uniq.HH]
+
+
+#clean up the WNT pathwa
+# uniq.WNT <- setdiff(paths.to.use$`hsa04310 Wnt signaling pathway`, paths.to.use$`hsa04340 Hedgehog signaling pathway`) %>% 
+#   setdiff(., paths.to.use$`hsa04350 TGF-beta signaling pathway`)
+# paths.to.use$`hsa04310 Wnt signaling pathway` <- paths.to.use$`hsa04310 Wnt signaling pathway`[paths.to.use$`hsa04310 Wnt signaling pathway` %in% uniq.WNT]
+paths.to.use$`hsa04310 Wnt signaling pathway` <- paths.to.use$`hsa04310 Wnt signaling pathway`[grep("^WNT", paths.to.use$`hsa04310 Wnt signaling pathway`)]
+
+
+#Clean up TGFB path
+# uniq.TGFB <- setdiff(paths.to.use$`hsa04350 TGF-beta signaling pathway`, paths.to.use$`hsa04340 Hedgehog signaling pathway`) %>% 
+#   setdiff(., paths.to.use$`hsa04310 Wnt signaling pathway`)
+# paths.to.use$`hsa04350 TGF-beta signaling pathway` <- paths.to.use$`hsa04350 TGF-beta signaling pathway`[paths.to.use$`hsa04350 TGF-beta signaling pathway` %in% uniq.TGFB]
+paths.to.use$`hsa04350 TGF-beta signaling pathway` <- paths.to.use$`hsa04350 TGF-beta signaling pathway`[grep("^BMP", paths.to.use$`hsa04350 TGF-beta signaling pathway`)]
+
+
+paths.to.use
+```
+
+```{r}
+cts_models <- in_counts[,heatmap.samps$Sample]
+cts_models <- cts_models[rowSums(cts_models) > 10, ]
+
+dds_models <- DESeq2::DESeqDataSetFromMatrix(round(cts_models, digits = 0),
+                                      colData = heatmap.samps,
+                                      design = ~ 1)
+
+
+vst_models <- DESeq2::vst(dds_models, blind = TRUE)
+dim(vst_models)
+
+
+in_vst_models <- SummarizedExperiment::assay(vst_models)
+
+dim(in_vst_models)
+head(in_vst_models[,1:5])
+```
+
+Order:
+CBF EC,  CBF MC, GFP EC and GFP MC. 
+
+```{r}
+col.order <- in_vst_models %>% 
+  as.data.frame() %>% 
+  rownames_to_column("gene") %>% 
+  filter(gene %in% unlist(paths.to.use)) %>% 
+  gather(Sample, VST, -gene) %>% 
+  left_join(., select(heatmap.samps,Sample, Comparisons),
+            by="Sample") %>% 
+  mutate_at(vars(Comparisons), ~factor(., levels=rev(c(
+                                                   "EC_Week12_CBFGLIS_CordBlood",
+                                                   "EC_Week6_CBFGLIS_CordBlood",
+                                                   "EC_Week1_CBFGLIS_CordBlood",
+                                                     
+                                                   "Myeloid_Week6_CBFGLIS_CordBlood",
+                                                   "Myeloid_Week1_CBFGLIS_CordBlood", 
+                                                   
+                                                   "EC_Week1_GFP_CordBlood",
+                                                   "Myeloid_Week1_GFP_CordBlood")))) %>% 
+  
+  left_join(., rownames_to_column(data.frame(gene=unlist(paths.to.use)), "pathway") %>% 
+              mutate(pathway=gsub("[0-9]{1,3}$", "", pathway)), 
+            by="gene") %>% 
+  arrange(Comparisons, pathway) %>% 
+  
+  group_by(Comparisons, pathway) %>%
+  arrange(desc(VST)) %>%
+  ungroup()  %>%
+  
+  select(Sample,Comparisons, pathway) %>% 
+  distinct() %>% 
+  arrange(Comparisons)
+  
+col.order
+
+
+# col.order %>%
+#   filter(path=="hsa04340 Hedgehog signaling pathway")
+
+
+```
+
+
+```{r fig.height=5, fig.width=17}
+heatmaps <- lapply(names(paths.to.use), function(path){
+  
+  col_order <- col.order %>%
+          filter(pathway==path)
+
+  mat <- in_vst_models[intersect(rownames(in_vst_models),paths.to.use[[path]]), col_order$Sample]
+
+  # mat <- logCPM[intersect(rownames(logCPM), paths.to.use[[path]]), heatmap.samps$Sample]
+  # mat <- logCPM_models[intersect(rownames(logCPM_models), paths.to.use[[path]]), heatmap.samps$Sample]
+  
+  
+  len <- 299
+  col <- colorRampPalette(c("deepskyblue4", "deepskyblue3", "deepskyblue2", "deepskyblue1","white",
+                            "firebrick1", "firebrick2", "firebrick3", "firebrick4"))(n=len)
+  col <- colorRampPalette(c("cyan1", "cyan2", "cyan3", "cyan4","black",
+                            "magenta4", "magenta3", "magenta2", "magenta1"))(n=len)
+
+  
+  p.pathway <- pheatmap::pheatmap(mat=mat,
+                       color=col,
+                       scale = "row",
+                       border_color="black",
+                       # breaks = Breaks,
+                       cluster_rows=TRUE,
+                       cluster_cols = FALSE,
+                       clustering_method="ward.D2",
+                       clustering_distance_cols="euclidean",
+                       annotation_names_col=TRUE,
+                       annotation_col  = heatmap.samps[,c("Culture_condition",
+                                                         "Transduction_condition",
+                                                         "Time_Point_Group")],
+                       annotation_colors=list("Culture_condition"=c("EC"="blue1","Myeloid"="red1"),
+                                                                    # "NBM"="black", "CD34_PB"="grey40", "CBFA2T3-GLIS2"="mediumorchid"),
+                                              "Transduction_condition"=c("GFP"="yellowgreen","CBFA2T3_GLIS"="lightseagreen"),
+                                                                         # "NBM"="black", "CD34_PB"="grey40", "CBFA2T3-GLIS2"="mediumorchid"),
+                                              "Time_Point_Group"=c("Week1"="steelblue1","Week6"="steelblue3", "Week12"="steelblue4")),
+                                                                   # "NBM"="black", "CD34_PB"="grey40", "CBFA2T3-GLIS2"="mediumorchid")),
+                       fontsize = 12,
+                       fontsize_row=12,
+                       fontsize_col=12,
+                       filename=paste0("Figures/Heatmaps/Pathway_Genes/TARGET_AML_CBFGLIS.models_",gsub(" ","_",path),"_vst_.pdf"),
+                       height = 5,
+                       width = 17,
+                       show_colnames=FALSE,
+                       show_rownames = TRUE)
+
+  
+})
+```
+
+
+
+
+# GSVA
+
+```{r}
+library(GSVA)
+```
+
+```{r}
+hallmark <- read.gmt("References/h.all.v7.2.symbols.gmt") #h.all.v7.2.symbols.gmt
+length(hallmark)
+hallmark$HALLMARK_HEDGEHOG_SIGNALING
+# table(hallmark$HALLMARK_HEDGEHOG_SIGNALING %in% rownames(logCPM))
+
+
+hallmark$HALLMARK_HEDGEHOG_SIGNALIN[!hallmark$HALLMARK_HEDGEHOG_SIGNALING %in% rownames(logCPM)]
+
+library(gageData)
+library(gage)
+
+data(egSymb)
+data(sigmet.idx.hs)
+data(kegg.sets.hs)
+kegg.sigmet <- kegg.sets.hs[sigmet.idx.hs]
+kegg.sigmet.sym <- lapply(kegg.sigmet, eg2sym)
+```
+
+```{r}
+# logCPM
+gsva.res.all <- gsva(expr = logCPM,
+                 gset.idx.list = c(hallmark, kegg.sigmet.sym),
+                 # annotation=,
+                 method="ssgsea",
+                 kcdf="Gaussian",
+                 parallel.sz=2, 
+                 mx.diff=TRUE,
+                 abs.ranking=FALSE, 
+                 tau=1,
+                 min.sz=20,
+                 max.sz=400,
+                 verbose=TRUE)
+```
+
+```{r}
+gsva.res.all <- read.csv("GSVA/TARGET_AML_CBFGLIS.models_patients_NBM_ssGSEA_scores.csv", row.names = 1)
+# write.csv(gsva.res.all, "GSVA/TARGET_AML_CBFGLIS.models_patients_NBM_ssGSEA_scores.csv")
+
+dim(gsva.res.all) #178 182
+head(gsva.res.all[,1:5])
+```
+
+
+```{r}
+cc.cultures <- c("CBFA2T3-GLIS2"="mediumorchid2",
+                 # "CD34_PB"="grey40",
+                 "NBM"="black",
+                 # "OtherAML"="grey80",
+                 "EC_Week1_GFP_CordBlood"="springgreen4",
+                 "EC_Week1_CBFGLIS_CordBlood"="blue2",
+                 "EC_Week6_CBFGLIS_CordBlood"="blue2",
+                 "EC_Week12_CBFGLIS_CordBlood"="blue2", 
+                 "Myeloid_Week1_GFP_CordBlood"="orange2", 
+                 "Myeloid_Week1_CBFGLIS_CordBlood"="deeppink", 
+                 "Myeloid_Week6_CBFGLIS_CordBlood"="deeppink")
+```
+
+```{r}
+heatmap.samps <- CBFGLIS_samples %>% 
+  filter(!grepl("pool|sort|pos|D63.EC", Sample),
+         !c(grepl("replicate", Sample) & Group=="NBM"),
+         !grepl("mock",Sample)) %>% 
+  filter(!grepl("(Week6|Week12)_GFP|CD34_PB", Comparisons)) %>% 
+  mutate_at(vars(Comparisons), ~factor(.,  levels=c(
+                                                    # "CD34_PB",
+                                                    "EC_Week1_GFP_CordBlood",
+                                                    "EC_Week1_CBFGLIS_CordBlood",
+                                                    "EC_Week6_CBFGLIS_CordBlood",
+                                                    "EC_Week12_CBFGLIS_CordBlood", 
+                                                    "Myeloid_Week1_GFP_CordBlood", 
+                                                    "Myeloid_Week1_CBFGLIS_CordBlood", 
+                                                    "Myeloid_Week6_CBFGLIS_CordBlood",
+                                                    "Myeloid_Week12_CBFGLIS_CordBlood",
+                                                    "CBFA2T3-GLIS2",
+                                                    "NBM"))) %>% 
+  filter(!grepl("Myeloid_Week12_CBFGLIS_CordBlood", Comparisons)) %>% 
+  droplevels() %>% 
+  mutate(Facet=factor(ifelse(grepl("CD34_PB|NBM|CBFA2T3-GLIS2",Comparisons), "Primary Samples", "CBFA2T3-GLIS2 HSPCs"), 
+                        levels=c("Primary Samples", "CBFA2T3-GLIS2 HSPCs"))) %>% 
+  
+  mutate(Label=gsub("TARGET.+((CBFA2T3_GLIS2|GFP).+)$","\\1", Sample)) %>% 
+  arrange(desc(Comparisons)) %>%
+  set_rownames(.$Sample)
+
+
+table(heatmap.samps$Comparisons)
+# dim(heatmap.samps)
+```
+
+```{r}
+gsva.res.TF.df <- gsva.res.all[,heatmap.samps$Sample] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("path") %>% 
+  gather(Sample, Score,-path) %>% 
+  inner_join(., heatmap.samps, by="Sample") %>%
+  filter(grepl("HEDGEHOG|WNT|TGF", path, ignore.case = T)) %>% 
+  filter(grepl("hsa", path)) %>% 
+  mutate(pathway=path,
+         path=gsub("hsa[0-9]+\\s", "", path)) %>% 
+  mutate(path=factor(path,levels=c("Hedgehog signaling pathway","TGF-beta signaling pathway","Wnt signaling pathway"))) %>% 
+  arrange(path) %>% 
+  select(pathway,path, everything())
+
+head(gsva.res.TF.df)
+# table(gsva.res.TF.df$NUP98.Rearranged.Groups)
+# length(unique(gsva.res.TF.df$path))
+# table(heatmap.samps$Comparisons)
+
+# 
+# openxlsx::addWorksheet(supp_table,
+#                        sheetName = "CBFA2T3-GLIS2 Associated Paths")
+# openxlsx::writeData(supp_table,
+#                     sheet = "CBFA2T3-GLIS2 Associated Paths",
+#                     dplyr::select(gsva.res.TF.df, Sample,
+#                                   pathway_info=pathway,
+#                                   path_name=path,
+#                                   Enrichemnt_Score=Score,
+#                                   AML_Subtype=Comparisons),
+#                     keepNA=FALSE,
+#                     rowNames=FALSE)
+
+
+```
+
+
+
+```{r fig.height=6, fig.width=25}
+# breaks <- plyr::round_any(seq(min(gsva.res.TF.df$Score), max(gsva.res.TF.df$Score), length.out=4), accuracy=0.05)
+gsva_breaks_list <- list("Wnt signaling pathway"=c(0.60,0.64,0.68,0.72),
+                         "TGF-beta signaling pathway"=c(0.58, 0.62, 0.66, 0.70),
+                         "Hedgehog signaling pathway"=c(0.42,0.48,0.54,0.60))
+
+gsva_boxplots <- lapply(as.character(unique(gsva.res.TF.df$path)), function(x){
+  
+  input <- droplevels(gsva.res.TF.df[gsva.res.TF.df$path==x,])
+
+  # breaks <-  plyr::round_any(seq(min(input$Score), max(input$Score), length.out=5), accuracy=0.02)
+  breaks <- gsva_breaks_list[[x]]
+
+  make_gsva_facet_boxplots(gsva_res = input,
+                      breaks=breaks)
+  
+  # return(input)
+})
+
+
+# table(is.na(gsva_boxplots[[1]]$Score))
+
+# gsva_boxplots
+
+# pdf("Figures/Boxplots/TARGET_AML_CBFGLIS.models_CBFGLIS.patients_ssGSEA_boxplots.pdf", height=6, width = 25)
+gridExtra::grid.arrange(grobs=gsva_boxplots, nrow=1)
+# dev.off()
+```
+
+```{r fig.width=15, fig.height=6}
+my_comparisons <- list(c("EC_Week1_GFP_CordBlood", "EC_Week1_CBFGLIS_CordBlood"),
+                       c("EC_Week1_GFP_CordBlood", "EC_Week6_CBFGLIS_CordBlood"),
+                       c("EC_Week1_GFP_CordBlood", "EC_Week12_CBFGLIS_CordBlood"),
+                       c("Myeloid_Week1_GFP_CordBlood", "Myeloid_Week1_CBFGLIS_CordBlood"),
+                       c("Myeloid_Week1_GFP_CordBlood", "Myeloid_Week6_CBFGLIS_CordBlood"),
+                       c("NBM","CBFA2T3-GLIS2"))
+
+
+ggplot(data=gsva.res.TF.df, aes(x=Comparisons, y=Score, fill=Comparisons)) +
+      geom_boxplot(alpha=0.2,outlier.shape = NA,  inherit.aes = TRUE)  +
+  stat_compare_means(comparisons = my_comparisons, method="t.test", 
+                     method.args = list(alternative="less"), 
+                     label="p.signif") + #"p.signif"
+  facet_wrap(~path) +
+  theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1))
+```
+
+
+
+
+### Significant Pathway enrichment
+
+```{r}
+#DE analysis with the gsva matrix.
+gsva_DE <- function(gsva_matrix,clinData,col,p.value=0.001){
+  #clinData must be factor leveled! 
+  
+  #Example:
+  # X <-  sample_info[samps_all, ] %>% 
+  #   mutate(USI=Sample) %>%
+  #   mutate_at(vars(NUP98.Rearranged.Groups), 
+  #             ~factor(., levels=c("OtherAML","NUP98-X"))) %>%
+  #   set_rownames(.$Sample)
+  # gsva_DE(gsva_matrix = gsva.res.all[,X$Sample],
+  #         clinData=X, 
+  #         col="NUP98.Rearranged.Groups",
+  #         p.value = 0.25)
+  
+  
+  library(edgeR)
+  library(limma)
+  
+  gsva <- gsva_matrix[,clinData$Sample]
+  design <- model.matrix(formula(paste("~0 +", col)),
+                         data=clinData)
+  colnames(design) <- c("Ref","Comparitor")
+  
+  print("this one")
+  
+  
+  cm <- makeContrasts("Comparitor-Ref", levels = design)
+  
+  
+  fit <- lmFit(gsva, design = design)
+  fit2 <- contrasts.fit(fit, contrasts = cm)
+  fit2 <- eBayes(fit2)
+  
+  allGeneSets <- topTable(fit2, p.value = p.value,number=Inf) %>% 
+    rownames_to_column("GeneSet") 
+    #object 'logFC' not found ℹ Input `..1` is `logFC???? And this error only happens in a lapply()
+    # dplyr::arrange(desc(logFC), desc(adj.P.Val))
+  
+  res <- list("contrast"=cm,"fit"=fit2, "gene_sets"=allGeneSets)
+  
+  return(allGeneSets)
+}
+
+```
+
+#### EC
+
+```{r}
+EC.comparisons <-  CBFGLIS_samples %>% #CBFGLIS.models %>% 
+  filter(!grepl("sort", Sample), !grepl("Week9", Time_Point_Group)) %>% 
+  filter(grepl("EC", Culture_condition)) %>% 
+  filter(grepl("GFP|CBFA2T3", Transduction_condition)) %>%
+  mutate(EC_Groups_GeneTargets=case_when(
+      grepl("EC_Week1_GFP", Comparisons) ~ "GFP", 
+      grepl("Week(6|12)_CBFGLIS", Comparisons) ~ "CBFGLIS")) %>% 
+  mutate(USI=Sample) %>% 
+  set_rownames(.$Sample)
+
+# table(EC.comparisons$Transduction_condition, EC.comparisons$Time_Point_Group)
+table(EC.comparisons$Comparisons)
+# table(EC.comparisons$EC_Groups_GeneTargets)
+# head(EC.comparisons[,1:5])
+```
+
+```{r}
+ref <- "GFP"
+conditions <- c("Week1","Week6", "Week12")
+
+DE.Paths.EC <- lapply(conditions,function(condition){
+  df <- filter(EC.comparisons, grepl(ref,Transduction_condition) | 
+         (grepl("GLIS",Transduction_condition) & Time_Point_Group == condition)) %>% 
+    mutate(Transduction_condition=factor(Transduction_condition,
+                                         levels=c(rev(names(table(.$Transduction_condition)))))) %>% 
+    set_rownames(.$Sample)
+  
+  
+  levels(df$Transduction_condition)
+  table(df$Transduction_condition)
+  
+  input <- gsva.res.all[grep("hsa", rownames(gsva.res.all)),df$Sample]
+  # dim(input)
+  
+  DE <- gsva_DE(gsva_matrix = input,
+                  clinData=df,
+                  col="Transduction_condition",
+                  p.value = 1)
+  
+  return(DE)
+})
+
+names(DE.Paths.EC) <- conditions
+
+
+# DE.Paths.EC
+```
+
+ns: p > 0.05
+*: p <= 0.05
+**: p <= 0.01
+***: p <= 0.001
+****: p <= 0.0001
+
+```{r}
+EC.paths.selected <- lapply(names(DE.Paths.EC), function(x)   
+  
+  dplyr::filter(DE.Paths.EC[[x]], grepl("Hedge|wnt|tgf",GeneSet, ignore.case = T)) %>% 
+         dplyr::select(GeneSet ,  matches("adj.P.Val")) %>% 
+         mutate(Culture="EC",
+                Time_point_Group=x,
+                Comparison="C/G-CB vs GFP-CB")
+  
+  ) %>%
+  bind_rows() %>% 
+  mutate(adj.P.Val=round(adj.P.Val, digits = 3)) %>% 
+  mutate(Signif_level=case_when(
+                  adj.P.Val > 0.05 ~ "n.s.",
+                  adj.P.Val <= 0.0001 ~ "****",
+                  adj.P.Val <= 0.001 ~ "***",
+                  adj.P.Val <= 0.01 ~ "**",
+                  adj.P.Val < 0.05 ~ "*",
+                ))
+
+# EC.paths.selected
+# write.csv(EC.paths.selected,"GSVA/TARGET_AML_CBFGLIS.models_vs_GFP_EC_pathways_of_interest.csv", row.names = FALSE)
+```
+
+
+#### MC
+
+```{r}
+MC.comparisons <- CBFGLIS_samples %>% 
+  filter(!grepl("scbulkleftovers|pool", Sample)) %>% 
+  filter(grepl("Myeloid", Culture_condition)) %>% 
+  filter(grepl("GFP|CBFA2T3", Transduction_condition)) %>% 
+  filter(!c(grepl("GFP", Transduction_condition) & grepl("Week12|Week6", Time_Point_Group))) %>% 
+  mutate(USI=Sample) %>% 
+  set_rownames(.$Sample)
+
+table(MC.comparisons$Transduction_condition, MC.comparisons$Time_Point_Group)
+
+table(MC.comparisons$Comparisons)
+# View(MC.comparisons)
+```
+
+```{r}
+ref <- "GFP"
+conditions <- c("Week1","Week6", "Week12")
+
+DE.Paths.MC <- lapply(conditions,function(condition){
+  df <- filter(MC.comparisons, grepl(ref,Transduction_condition) | 
+         (grepl("GLIS",Transduction_condition) & Time_Point_Group == condition)) %>% 
+    mutate(Transduction_condition=factor(Transduction_condition,
+                                         levels=c(rev(names(table(.$Transduction_condition)))))) %>% 
+    set_rownames(.$Sample)
+  
+  
+  levels(df$Transduction_condition)
+  table(df$Transduction_condition)
+  
+  input <- gsva.res.all[grep("hsa", rownames(gsva.res.all)),df$Sample]
+  # dim(input)
+  
+  DE <- gsva_DE(gsva_matrix = input,
+                  clinData=df,
+                  col="Transduction_condition",
+                  p.value = 1)
+  
+  return(DE)
+})
+
+names(DE.Paths.MC) <- conditions
+# DE.Paths.EC
+```
+
+```{r}
+MC.paths.selected <- lapply(names(DE.Paths.MC), function(x)   
+  
+  filter(DE.Paths.MC[[x]], grepl("Hedge|wnt|tgf",GeneSet, ignore.case = T)) %>% 
+         dplyr::select(GeneSet ,  matches("adj.P.Val")) %>% 
+         mutate(Culture="MC",
+                Time_point_Group=x,
+                Comparison="C/G-CB vs C/G-GFP")
+  
+  ) %>%
+  bind_rows() %>% 
+  mutate(adj.P.Val=round(adj.P.Val, digits = 3)) %>% 
+  mutate(Signif_level=case_when(
+                  adj.P.Val > 0.05 ~ "n.s.",
+                  adj.P.Val <= 0.0001 ~ "****",
+                  adj.P.Val <= 0.001 ~ "***",
+                  adj.P.Val <= 0.01 ~ "**",
+                  adj.P.Val < 0.05 ~ "*",
+                ))
+
+MC.paths.selected
+# write.csv(MC.paths.selected,"GSVA/TARGET_AML_CBFGLIS.models_vs_GFP_MC_pathways_of_interest.csv", row.names = FALSE)
+```
+
+
+```{r}
+gsva_sig_res <- bind_rows(EC.paths.selected, MC.paths.selected)
+
+
+# openxlsx::addWorksheet(supp_table,
+#                        sheetName = "HH, WNT, BMP ssGSEA Enrichment")
+# openxlsx::writeData(supp_table,
+#                     sheet = "HH, WNT, BMP ssGSEA Enrichment",
+#                     gsva_sig_res,
+#                     keepNA=FALSE,
+#                     rowNames=FALSE)
+```
+
+
+
+#Check for Contaminants 
+
+```{r}
+#EC marker genes
+# markers <- c( "CD144", "CD31")
+markers <- c("CDH5","PECAM1","RAI2","STXBP6","SLC30A3")
+
+filter(geneIDmap, gene_name %in% markers)
+```
+
+```{r}
+input_samples <- CBFGLIS_samples %>% 
+  filter(!grepl("pool", Sample)) %>% 
+  #CD34_PB|CBFA2T3|NBM
+  filter(grepl("CBFA2T3|NBM", Comparisons) | 
+           grepl("EC_Week1_GFP|EC_Week(1|6|12)_CBFGLIS|Myeloid_Week1_GFP|Myeloid_Week(1|6)_CBFGLIS", Comparisons)) %>% 
+  
+  #"CD34_PB", "NBM","CBFA2T3-GLIS2",
+  mutate(Comparisons=factor(Comparisons, levels=c( "NBM","CBFA2T3-GLIS2",
+                                                    "EC_Week1_GFP_CordBlood",
+                                                   "EC_Week1_CBFGLIS_CordBlood",
+                                                   "EC_Week6_CBFGLIS_CordBlood",
+                                                   "EC_Week12_CBFGLIS_CordBlood",
+                                                   
+                                                    "Myeloid_Week1_GFP_CordBlood",
+                                                   "Myeloid_Week1_CBFGLIS_CordBlood",
+                                                    "Myeloid_Week6_CBFGLIS_CordBlood"))) %>%
+  arrange(desc(Comparisons)) %>%
+  set_rownames(.$Sample)
+  
+table(input_samples$Comparisons)
+```
+
+```{r}
+TPM.markers <- TPM[rownames(TPM) %in% markers, input_samples$Sample] %>% 
+  rownames_to_column("gene") %>% 
+  gather(Sample, TPM, -gene) %>% 
+  mutate(log2_TPM=log2(TPM+1)) %>% 
+  left_join(., input_samples, by="Sample")
+
+head(TPM.markers)
+```
+
+```{r fig.width=20, fig.height=5}
+# pdf("TARGET_AML_SLC30A3_expression_boxplots.pdf", height = 5, width = 20)
+ggplot(filter(TPM.markers, grepl("SLC30A3", gene)),
+       aes(x=Comparisons, y=log2_TPM, fill=Comparisons)) +
+  geom_boxplot() +
+  facet_wrap(~gene, scales="free") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1))
+
+# dev.off()
+```
+
+```{r}
+input_samples %>% 
+  group_by(Comparisons) %>% 
+  count() %>% 
+  write.csv(., "TARGET_AML_CBFGLIS.models_Samples_Table.csv", row.names = FALSE)
+```
+
+# Target Genes 
+
+```{r}
+#Read in 
+all_targets <- read.delim("Theraputic_Targets/ALL_GENES.output.candidate_genes.gt50percent_gt2stdev_for1subtype.v3.tsv",
+                          sep="\t", header = FALSE) %>% 
+  rename_all(~c("gene_name","Enriched_Groups")) %>%
+  left_join(., geneIDs, by="gene_name") %>%
+  left_join(., select(geneIDmap,-gene_name),
+            by="gene_id") %>% 
+  mutate(CBFGLIS.Enriched=case_when(
+    grepl("cbfa2t3-glis2", Enriched_Groups) ~ "Yes",
+    TRUE ~ "No"))
+
+
+head(all_targets)
+dim(all_targets)
+
+# table(all_targets$CBFGLIS.Enriched) #299 enriched in CBFGLIS
+
+
+#Read in the DEGs results
+DEGs.EC.week7 <- read.csv("DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_Week7_EC.culture_DEGs_5.21.21.csv", comment.char = "#")
+
+
+DEGs.EC.week12 <- read.csv("DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_Week12_EC.culture_DEGs_5.21.21.csv",comment.char = "#")
+
+```
+
+```{r}
+samples_to_use <- CBFGLIS_samples %>% 
+  filter(!grepl("pool", Sample)) %>%
+  filter(!grepl("_replicate", Sample)) %>% 
+  #CD34_PB|CBFA2T3|NBM
+  filter(grepl("CBFA2T3|NBM|CD34_PB", Comparisons) | 
+           grepl("EC_Week1_GFP|EC_Week(6|12)_CBFGLIS", Comparisons)) %>% 
+  
+  #"CD34_PB", "NBM","CBFA2T3-GLIS2",
+  mutate(Comparisons=factor(Comparisons, levels=c( "NBM",
+                                                   "CD34_PB",
+                                                   "CBFA2T3-GLIS2",
+                                                    "EC_Week1_GFP_CordBlood",
+                                                   # "EC_Week1_CBFGLIS_CordBlood",
+                                                   "EC_Week6_CBFGLIS_CordBlood",
+                                                   "EC_Week12_CBFGLIS_CordBlood"))) %>% 
+                                                   
+                                                   #  "Myeloid_Week1_GFP_CordBlood", 
+                                                   # "Myeloid_Week1_CBFGLIS_CordBlood",
+                                                   #  "Myeloid_Week6_CBFGLIS_CordBlood"))) %>%
+  arrange(desc(Comparisons)) %>%
+  mutate(Group=case_when(
+    grepl("NBM|CD34_PB", Comparisons) ~ "Normals",
+    TRUE ~ as.character(Comparisons))) %>% 
+  set_rownames(.$Sample)
+  
+table(samples_to_use$Comparisons)
+table(samples_to_use$Group)
+dim(samples_to_use)
+```
+
+
+```{r}
+# volcano_plots_list <- dir("DEGs/for_volcano_plots/", full.names = TRUE)
+# 
+# volcano_plots_dfs <- lapply(volcano_plots_list, read.csv, comment.char="#")
+# names(volcano_plots_dfs) <-  dir("DEGs/for_volcano_plots/")
+# lapply(volcano_plots_dfs, head)
+```
+
+## Filter for Absent Expression
+
+```{r}
+#Calculate summary statistics for target genes
+TPM.ratio.res <- TPM[rownames(TPM) %in% all_targets$gene_name,samples_to_use$Sample] %>% 
+  rownames_to_column("gene") %>% 
+  gather(Sample, TPM, -gene) %>% 
+  
+  left_join(., samples_to_use, by="Sample") %>% 
+  group_by(gene, Group) %>% 
+  summarize(min=min(TPM),
+            median=median(TPM),
+            mean=mean(TPM),
+            max=max(TPM),
+            percent_expressors=round((sum(TPM >= 1.0)/n())*100, digits = 2)) %>% 
+  mutate(Range=max-min) %>% 
+  ungroup() %>% 
+  rename_at(vars(min:Range), ~paste0(.,"_TPM")) %>% 
+  
+  gather(Stat,Value, -gene, -Group) %>%
+  pivot_wider(id_cols = gene,
+              names_from=c(Group,Stat),
+              values_from=Value) %>%
+
+  select(colnames(.)[order(colnames(.))]) %>%
+  select(gene, matches("^Normals"), matches("^NBM"),everything())
+
+
+head(TPM.ratio.res)
+dim(TPM.ratio.res) #993  31
+```
+
+```{r}
+TPM.ratio.filt <- TPM.ratio.res %>% 
+  filter(Normals_max_TPM < 1.0)
+
+dim(TPM.ratio.filt) #607
+# table(samples_to_use$Comparisons)
+```
+
+
+## Filter for CBFGLIS Over-expression
+
+```{r}
+all_inputs <- list(all_targets=TPM.ratio.filt$gene,
+                   DEGs.EC.week7=DEGs.EC.week7$gene[DEGs.EC.week7$logFC > 0],
+                   DEGs.EC.week12=DEGs.EC.week12$gene[DEGs.EC.week12$logFC > 0],
+                   CBFGLISvsNBM=CBFGLISvsNBM$gene_name[CBFGLISvsNBM$logFC > 0])
+
+lapply(all_inputs, head)
+sapply(all_inputs, length)
+```
+
+```{r}
+res_4_inputs <- multi_intersect(l=all_inputs)
+res_4_inputs <- res_4_inputs[order(res_4_inputs)]
+
+
+# res_4_inputs
+length(res_4_inputs) #50 genes
+
+
+# openxlsx::addWorksheet(supp_table,
+#                        sheetName = "CBFA2T3-GLIS2 DEGs vs NBM")
+# openxlsx::writeData(supp_table,
+#                     sheet = "CBFA2T3-GLIS2 DEGs vs NBM",
+#                     CBFGLISvsNBM,
+#                     keepNA=FALSE,
+#                     rowNames=FALSE)
+
+```
+
+```{r}
+#Subset the DEGs results
+targets.df <- lapply(names(all_inputs)[-1], function(x){
+  
+  dataset <- gsub("DEGs.", "", gsub("7", "6", x))
+  input <- get(x)
+  res <- input %>%
+    dplyr::select(matches("^gene$|^gene_name$"), logFC, adj.P.Val) %>%
+    rename_at(vars(logFC:adj.P.Val), ~paste(., dataset, sep="_"))
+
+
+  if(x=="CBFGLISvsNBM"){
+    res$gene <- res$gene_name
+    res <- res[,-grep("gene_name", colnames(res))]
+  }
+
+
+  res <- res %>%
+    filter(gene %in% res_4_inputs)
+
+  return(res)
+  
+})
+
+#join the dataframes
+targets.df <- Reduce(function(x, y, ...) inner_join(x, y, by="gene"), targets.df) %>%
+  left_join(., all_targets, by=c("gene"="gene_name")) %>%
+  dplyr::select(gene, Cell_Surface_Protein, Cell_Adhesion_Gene,  Transmembrane_Helix, gene_type, everything()) %>%
+  arrange(desc(Cell_Surface_Protein), desc(logFC_EC.week12))
+
+#Calculate summary statistics for target genes
+TPM.targets <- TPM[rownames(TPM) %in% targets.df$gene,samples_to_use$Sample] %>% 
+  rownames_to_column("gene") %>% 
+  gather(Sample, TPM, -gene) %>% 
+  
+  left_join(., samples_to_use, by="Sample") %>% 
+  group_by(gene, Comparisons) %>% 
+  summarize(min=min(TPM),
+            median=median(TPM),
+            mean=mean(TPM),
+            Q3=quantile(TPM, probs=0.75),
+            max=max(TPM),
+            percent_expressors=round((sum(TPM >= 1.0)/n())*100, digits = 2)) %>% 
+  mutate(Range=max-min) %>% 
+  ungroup() %>% 
+  rename_at(vars(min:Range), ~paste0(.,"_TPM")) %>% 
+  
+  gather(Stat,Value, -gene, -Comparisons) %>%
+  pivot_wider(id_cols = gene,
+              names_from=c(Comparisons,Stat),
+              values_from=Value) %>%
+  
+  #Filter to ensure that genes are not also expressed in the GFP controls
+  filter(EC_Week1_GFP_CordBlood_max_TPM < 1.0) %>%
+
+  #Reoder the columns 
+  select(colnames(.)[order(colnames(.))]) %>%
+  select(gene, matches("^NBM"),everything()) %>% 
+  rename_at(vars(matches("CBFA2T3-GLIS2")), ~gsub("-", "\\.", .))
+
+
+# options(scipen = 999)
+# dim(TPM.targets)
+# head(TPM.targets)
+
+#Merge in the summary stats
+targets.df <- targets.df %>% 
+  inner_join(., TPM.targets, by="gene") %>% 
+  select(gene:adj.P.Val_CBFGLISvsNBM, matches("^NBM|CBFA2T3|EC"), 
+         everything())
+
+
+# head(targets.df)
+dim(targets.df) # 42 67 
+table(targets.df$Cell_Surface_Protein)
+# write.csv(targets.df, "Theraputic_Targets/TARGET_AML_CBFGLIS.models_AMLrestrictedGene_Targets_SummaryStats_07.06.21.csv", row.names = FALSE)
+```
+
+
+## Filter for expression in CBFGLIS 
+
+```{r}
+quantile(targets.df$EC_Week6_CBFGLIS_CordBlood_Range_TPM)
+quantile(targets.df$EC_Week12_CBFGLIS_CordBlood_Range_TPM)
+
+
+
+# targets.df %>%
+#   filter(gene=="FOLR1") %>% 
+#   select(gene, matches("Q3"))
+
+```
+
+```{r}
+targets.df.filtered <- targets.df  %>% 
+  filter(Cell_Surface_Protein=="Yes") %>% 
+  
+  #low in NBM, but large amount of expressors in the CBFGLIS CB+
+  filter(EC_Week6_CBFGLIS_CordBlood_percent_expressors_TPM >= 75.0, 
+         EC_Week12_CBFGLIS_CordBlood_percent_expressors_TPM >= 75.0) %>%  
+  
+  #dynamic range filter
+  filter(EC_Week6_CBFGLIS_CordBlood_max_TPM >= 5.0, 
+         EC_Week12_CBFGLIS_CordBlood_max_TPM >= 5.0) %>% 
+  
+  
+  arrange(desc(round(logFC_EC.week12))) %>% 
+  mutate(Rank=1:n()) %>%
+  select(gene, Rank, everything())
+
+
+# targets.df.filtered
+dim(targets.df.filtered)
+targets.df.filtered
+
+
+# quantile(targets.df.filtered$CBFA2T3.GLIS2_percent_expressors_TPM) # 4 targets have >
+# quantile(targets.df.filtered$EC_Week6_CBFGLIS_CordBlood_percent_expressors)
+# quantile(targets.df.filtered$EC_Week1_GFP_CordBlood_max)
+
+
+# write.csv(targets.df.filtered, "Theraputic_Targets/TARGET_AML_CBFGLIS.models_AMLrestrictedGene_Targets_filtered_on_CBmodelsOnly_10.18.21.csv", row.names = FALSE)
+```
+
+```{r}
+# openxlsx::addWorksheet(supp_table,
+#                        sheetName = "CAR-T Targets")
+# openxlsx::writeData(supp_table,
+#                     sheet = "CAR-T Targets",
+#                     dplyr::select(targets.df.filtered,-c(Cellular.Compartment_Membrane:CBFGLIS.Enriched),
+#                                   -Enriched_Groups, -Ensembl_ProteinID_with_MembraneLocalization),
+#                     keepNA=FALSE,
+#                     rowNames=FALSE)
+## write out the final results
+# openxlsx::saveWorkbook(supp_table,
+#                        "CBFA2T3.GLIS2_HSPCs_Supplemental_Tables_Raw_Figure_Data.xlsx",
+#                        overwrite = T)
+```
+
+
+## Gene Targets Figures 
+
+## Violin plots 
+
+```{r}
+samps_for_violin <- CBFGLIS_samples %>% 
+  filter(!grepl("pool|sort|pos|D63.EC", Sample),
+         !c(grepl("replicate", Sample) & Group=="NBM"),
+         !grepl("mock",Sample)) %>% 
+  # filter(!grepl("(Week6|Week12)_GFP|CD34_PB", Comparisons)) %>% 
+  filter(grepl("CBFA2T3-GLIS2|NBM|CD34_PB", Comparisons)) %>% 
+  mutate_at(vars(Comparisons), ~factor(.,  levels=c(
+                                                   
+                                                    # "EC_Week1_GFP_CordBlood",
+                                                    # "EC_Week1_CBFGLIS_CordBlood",
+                                                    # "EC_Week6_CBFGLIS_CordBlood",
+                                                    # "EC_Week12_CBFGLIS_CordBlood", 
+                                                    # "Myeloid_Week1_GFP_CordBlood", 
+                                                    # "Myeloid_Week1_CBFGLIS_CordBlood", 
+                                                    # "Myeloid_Week6_CBFGLIS_CordBlood",
+                                                    # "Myeloid_Week12_CBFGLIS_CordBlood",
+                                                    "CBFA2T3-GLIS2",
+                                                     "CD34_PB",
+                                                    "NBM"))) %>% 
+  filter(!grepl("Myeloid_Week12_CBFGLIS_CordBlood", Comparisons)) %>% 
+  droplevels() %>% 
+  mutate(Facet=factor(ifelse(grepl("CD34_PB|NBM|CBFA2T3-GLIS2",Comparisons), "Primary Samples", "CBFA2T3-GLIS2 HSPCs"), 
+                        levels=c("Primary Samples","CBFA2T3-GLIS2 HSPCs")))
+  
+
+# table(samps_for_violin$Comparisons, useNA='ifany')
+# table(samps_for_violin$Facet, useNA='ifany')
+# table(samps_for_violin$Culture_condition, useNA='ifany')
+# unique(samps_for_violin$Comparisons[order(samps_for_violin$Comparisons)])
+
+
+
+targets.expn <- CPM[targets.df.filtered$gene,samps_for_violin$Sample] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("gene_name") %>% 
+  gather(Sample, CPM, -gene_name) %>% 
+  mutate(log2CPM=log2(CPM+1)) %>% 
+  left_join(.,samps_for_violin, by="Sample")
+
+# targets.expn
+levels(targets.expn$Comparisons)
+```
+
+```{r fig.width=10, fig.height=5}
+
+# pdf("TARGET_AML_Immunotheraputic_Targets.pdf", height = 5, width = 10)
+ggplot(targets.expn, aes(x=gene_name, y=log2CPM)) +
+  geom_point(aes(color=Comparisons), position=position_jitterdodge(jitter.width=0.75)) +
+  # geom_boxplot(aes(fill=Comparisons, alpha=0.3)) +
+  geom_violin(aes(fill=Comparisons), draw_quantiles = 0.5,
+              scale="width", alpha=0.5) +
+  scale_color_manual(values=c("CBFA2T3-GLIS2"="dodgerblue4", "NBM"="transparent", "CD34_PB"="transparent"),
+                     labels=c("CBFA2T3-GLIS2"="CBFA2T3-GLIS2 AML", "NBM"="Normal Marrows", "CD34_PB"="CD34+ PB")) +
+  scale_fill_manual(values=c("CBFA2T3-GLIS2"="dodgerblue4", "NBM"="black", "CD34_PB"="grey80"),
+                    labels=c("CBFA2T3-GLIS2"="CBFA2T3-GLIS2 AML", "NBM"="Normal Marrows", "CD34_PB"="CD34+ PB")) +
+  labs(x="Immunotheraputic Target Genes", y="Normalized Expression\n(log2 CPM)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(size=18, color="black"),
+        axis.text.y = element_text(size=18, color="black"), 
+        axis.title = element_text(size=20), 
+        legend.position = c(0.15, 0.9),
+        legend.text = element_text(size=14),
+        legend.title = element_blank())
+
+# dev.off()
+```
+
+
+
+## Volcano plots
+
+```{r fig.height=7, fig.width=10}
+library(ggrepel)
+require(circlize)
+library(RColorBrewer)
+```
+
+```{r}
+degs.cbfglis <- read.csv("DEGs/for_volcano_plots/TARGET_AML_CBFGLIS_vs_NBM_DEGs_forVolcanoPlots.csv", comment.char = "#") %>% 
+  mutate(label=ifelse(gene_name %in% targets.df.filtered$gene,gene_name,""),
+         Neg.log10_FDR=-log10(FDR))
+
+head(degs.cbfglis)
+range(degs.cbfglis$log2FC)
+```
+
+
+
+```{r fig.height=8, fig.width=8, warning=FALSE}
+# colorPal <- colorRampPalette(c("dodgerblue3", "dodgerblue2", "dodgerblue1","white","red1", "red2", "red3", "red4"))(n=299)
+# colorPal <- viridis::turbo(299)
+# colorPal <- colorRampPalette(rev(brewer.pal(n=10,"RdBu")))(n=20)
+#"#D1E5F0",
+colorPal <- colorRampPalette(c("#053061", "#2166AC", "#4393C3", "#92C5DE",  "white","#FDDBC7", "#F4A582", "#D6604D", "#B2182B", "#67001F"))(n=20)
+
+
+# pdf("CBFGLIS_vs_OtherAML_DEGs_VolcanoPlot.pdf", height = 8, width =8)
+volcano <- ggplot(degs.cbfglis, aes(x=log2FC, y=Neg.log10_FDR, label = label)) + 
+  geom_point(aes(colour= log2FC), size=5, alpha=1) +
+
+  scale_color_gradientn(colours = colorPal,
+                        values=scales::rescale(c(-1,-0.075,1)),
+                        name="Log2 FC") +
+  # scale_color_gradient2(low="#67A9CF", mid="#F7F7F7", high="#EF8A62") +
+  # scale_color_gradient2() +
+  scale_x_continuous(limits = c(-9,11), breaks = c(-10,6,-2,0,2,6,10)) +
+  theme(plot.title = element_text(hjust = 0.5, size = 18),
+                       panel.background = element_rect(fill="white"),
+                       panel.grid.major = element_blank(),
+                       panel.grid.minor = element_blank(),
+                       panel.border = element_rect(color = "black", fill=NA),
+                       axis.text = element_text(color = "black"),
+                       axis.text.x = element_text(angle = 0,hjust=0.5,vjust = 0.5, size = 18),
+                       axis.text.y = element_text(size = 18),
+                       axis.title = element_text(size = 18),
+                       plot.margin = margin(8,2,20,2),
+        legend.position = c(0.185,0.94),
+        legend.direction = "horizontal",
+        legend.text = element_text(size=14),
+        legend.title = element_text(size=14, hjust = -0.5),
+        legend.key.size =  unit(0.75, "cm")) +
+  labs(x="Log2 Fold-Change (FC)", y="-log10(FDR)", title="DE Genes in CBFA2T3-GLIS2\n Diagnostic AML") +
+    geom_text_repel(size=6,min.segment.length=unit(0.0001,"mm"),
+                    box.padding = unit(0.5, "lines"),
+                    point.padding = unit(0.3, "lines"),
+                    nudge_x=1, fontface="bold")
+ 
+
+volcano
+
+# dev.off()
+```
+
+
+## Correlate FCs 
+```{r}
+targets.df.filtered <- targets.df.filtered %>% 
+  mutate(Percent_Expressors=round(`CBFA2T3-GLIS2_percent_expressors_TPM`)) %>% 
+  mutate(Percent_Expressors_binned=case_when(
+    Percent_Expressors >= 70 & Percent_Expressors < 80 ~ "70-79%",
+    Percent_Expressors >= 80 & Percent_Expressors < 90 ~ "80-89%",
+    Percent_Expressors >= 90  ~ "90-100%"))
+
+
+dim(targets.df.filtered)
+```
+
+```{r}
+targets.df.filtered$NBM_median_TPM
+targets.df.filtered$EC_Week12_CBFGLIS_CordBlood_mean_TPM
+targets.df.filtered$EC_Week12_CBFGLIS_CordBlood_percent_expressors_TPM
+
+# -log10(targets.df.filtered$adj.P.Val_CBFGLISvsNBM)
+targets.df.filtered$`CBFA2T3-GLIS2_mean_TPM`
+targets.df.filtered$`CBFA2T3-GLIS2_median_TPM`
+```
+
+```{r}
+library(RColorBrewer)
+gene_colors <- brewer.pal(9,"Set1") 
+gene_colors <- gene_colors[-c(5:6)]
+gene_colors <- c(gene_colors, "khaki3","cadetblue3") %>%  #"burlywood3"
+  set_names(targets.df.filtered$gene)
+
+names(gene_colors)[1] <- "FOLR1"
+names(gene_colors)[2] <- "HPSE2"
+
+
+barplot(rep(1,9), col=gene_colors,names.arg = names(gene_colors), las=2)
+```
+
+```{r}
+table(targets.df.filtered$Percent_Expressors)
+pt_sizes <- c("70-79%"=5, "80-89%"=7, "90-100%"=9)
+```
+
+```{r fig.height=7, fig.width=10}
+ranked_plot <- ggplot(targets.df.filtered, 
+                      aes(x=logFC_EC.week12, 
+                          y=logFC_CBFGLISvsNBM,
+                          # size=`CBFA2T3-GLIS2_median_TPM`,
+                          # shape=Percent_Expressors_binned,
+                          color=gene,
+                          )) +
+  # geom_smooth(data=targets.df.filtered, 
+  #             aes(x=logFC_EC.week12, y=logFC_CBFGLISvsNBM),
+  #             alpha=0.1,
+  #             formula = 'y ~ x', method = lm, 
+  #             inherit.aes = FALSE) +
+  geom_point(alpha=1.0, size=7) +
+  geom_text_repel(aes(label=gene),
+                  point.padding = unit(3,"mm"),
+                  min.segment.length = unit(5, "mm")) +
+  guides(color=FALSE) +
+         # size=guide_legend(title="")) + #Percent Expressing Gene\nin CBFA2T3-GLIS2
+
+  # scale_size_continuous(breaks=c(70,80,90,100), range=c(3,10)) +
+  # scale_size_continuous(breaks=c(4,6,8,10), range=c(3,7)) +
+  # scale_size_manual(values=pt_sizes)) +
+
+  scale_color_manual(values=gene_colors) +
+  scale_x_continuous(breaks=c(2,4,6,8,10), limits=c(1,10)) +
+  scale_y_continuous(breaks=c(2,4,6,8,10), limits=c(1,10)) +
+  
+  labs(x="log2 FC  (CBFA2T3-GLIS2 EC Week 12)", y="Log2 FC (CBFA2T3-GLIS2 Patients)",
+       title="Theraputic Targets in CBFA2T3-GLIS2 AML") +
+  theme_classic() +
+  theme(axis.text = element_text(size=12, color="black"),
+        axis.title = element_text(size=16, color="black"))
+
+ranked_plot
+```
+
+
+```{r}
+# ggsave(plot=ranked_plot, filename = "Figures/TARGET_AML_Gene_Targets_Top10_ScatterPlot_5.21.21.pdf", height = 5, width = 7)
+```
+
+```{r}
+# filter(targets.df, gene %in% c("NCAM1", "GABRE"))
+```
+
+```{r}
+nbm.NCAM1 <- TPM["NCAM1",grep("RO[0-9]|BM[0-9]", colnames(TPM))]
+nbm.NCAM1[order(nbm.NCAM1, decreasing = T)]
+```
+
+# FOLR1 MFI
+
+```{r}
+MFI <- read.table("2021_ASH/MFI_Fold_Change_FOLR1.txt",header = TRUE) %>% 
+  mutate(Sample=paste0("Sample",1:nrow(.))) %>% 
+  gather(Cell_Type, MFI_FC, AML:Myeloid)
+
+head(MFI)
+```
+
+```{r}
+range(MFI$MFI_FC)
+```
+
+```{r fig.height=5, fig.width=4.5}
+# pdf("TARGET_AML_FoldChange_MFI_FOLR1_boxplot.pdf", height = 5, width = 4.5)
+ggplot(MFI, aes(x=Cell_Type, y=MFI_FC, fill=Cell_Type, color=Cell_Type)) +
+  geom_boxplot(alpha=0.3) +
+  geom_point(position =   ggbeeswarm::position_quasirandom()) +
+  scale_fill_manual(values=c("AML"="dodgerblue4", "Lymph"="black", "Mono"="grey50", "Myeloid"="grey80"),
+                    labels=c("AML"="CBFA2T3-GLIS2", "Lymph"="Lymphocytes","Mono"="Monocytes", "Myeloid"="Myeloid")) +
+  scale_color_manual(values=c("AML"="dodgerblue4", "Lymph"="black", "Mono"="grey50", "Myeloid"="grey80"),
+                    labels=c("AML"="CBFA2T3-GLIS2", "Lymph"="Lymphocytes","Mono"="Monocytes", "Myeloid"="Myeloid")) +
+  scale_x_discrete(labels=c("AML"="CBFA2T3-GLIS2", "Lymph"="Lymphocytes","Mono"="Monocytes", "Myeloid"="Myeloid")) +
+  labs(y="Fold-Change MFI [AML/Normal]", x="Cell Type") +
+  theme_classic() +
+    theme(axis.text.x = element_text(size=10, color="black", angle=10, vjust=1, hjust=1),
+        axis.text.y = element_text(size=16, color="black"), 
+        axis.title = element_text(size=16), 
+        legend.position = c(0.75, 0.9),
+        legend.text = element_text(size=14),
+        legend.title = element_blank())
+
+# dev.off()
+```
+
+
+# WT1 Transcript Expression 
+
+## Tximport for transcript level TPM
+
+```{r}
+transcriptIDmap.ref <- read.delim(file.path(PROJHOME, "0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_TranscriptLevel_IDmap_1.18.20.txt"),
+                                  sep="\t") 
+  # mutate_at(vars(gene_id:transcript_id), ~gsub("\\.[0-9]{1,2}", "",.))
+
+# dim(transcriptIDmap.ref) #207826     22
+head(transcriptIDmap.ref)
+```
+
+```{r}
+res <- dir(file.path(SCRATCH,"jlsmith3/CBFGLIS/kallisto"), pattern=".h5",recursive = T, full.names = T)
+names(res) <- gsub("^.+kallisto\\/(TAR.+)_with.+h5$","\\1", res) %>% 
+  gsub("-",".", .)
+
+# head(res)
+length(res) #50
+
+tx2gene <- dplyr::select(transcriptIDmap.ref, transcript_id, gene_id)
+
+head(tx2gene)
+# dim(tx2gene)
+```
+
+```{r}
+txLvl <- tximport::tximport(files=res,
+                              type="kallisto",
+                              tx2gene = tx2gene,
+                              txIn = TRUE,
+                              txOut=TRUE,
+                              ignoreAfterBar = TRUE)
+```
+
+```{r}
+# str(geneLvl)
+names(txLvl)
+# txLvl$countsFromAbundance
+# saveRDS(txLvl, "Expression_Data/TARGET_AML_CBFGLIS_CordBlood_transcriptLevel_Tximport.RDS")
+```
+
+```{r}
+# lapply(c("abundance","counts","length"),
+#        function(df) {type <- case_when(grepl("abund",df) ~ "TPM", grepl("count",df) ~ "scaledTPM", TRUE ~ "");
+#        saveRDS(geneLvl[[df]], paste0("TARGET_AML_CBFGLIS_Models_transcriptLevel_",type,"_",df,".RDS"))})
+```
+
+```{r}
+TPM.reference <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/Kallisto_GRCh38_Gencode_v29/transcript_level/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Kallisto_Quant_TranscriptLevel_Abundance_TPM.RDS"))
+
+dim(TPM.reference)
+```
+
+samps_all 
+
+```{r}
+# TPM.all <- 
+```
+
+## FOLR1 Expression
+
+```{r}
+FOLR1.samps <- manifest %>% 
+    filter(grepl("NBM|CD34_PB|diagnostic", Time_point), 
+         grepl("AML|NBM|CD34_PB", Group))  %>% 
+  filter(Sample %in% colnames(TPM.reference))
+
+dim(FOLR1.samps)
+```
+
+```{r}
+FOLR1.txIDs <- transcriptIDmap.ref %>%
+  filter(grepl("FOLR1", gene_name))
+
+FOLR1.txIDs
+# dir.create("FOLR1")
+```
+
+```{r}
+FOLR1.sqanti <- sqanti %>% 
+  filter(grepl("FOLR1", associated_gene)) %>% 
+  arrange(structural_category)
+  # filter(!grepl("mono-exon", ))
+
+# FOLR1.sqanti
+# head(FOLR1.sqanti)
+# write.csv(FOLR1.sqanti,file.path(PROJHOME, "2017.02.15_CBF-GLIS_DEG/2020.12.23_CBFGLIS_Models/SQANTI_FOLR1_PacBio_LongRead_RNAseq.csv"), row.names = FALSE)
+```
+
+```{r}
+FOLR1.tx.TPM <- TPM.reference[,FOLR1.samps$Sample] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("transcript_id") %>% 
+  inner_join(., select(FOLR1.txIDs, transcript_id, gene_name), 
+             by="transcript_id") %>% 
+  gather(Sample, TPM, -transcript_id, -gene_name) 
+  
+  
+FOLR1.tx.dom <- FOLR1.tx.TPM %>% 
+  group_by(Sample) %>%
+  mutate(Rank=rank(TPM, ties.method = "first")) %>% 
+  mutate(DominantSpecies=case_when(
+    Rank==max(Rank) ~ transcript_id[Rank==max(Rank)],
+    Rank!=max(Rank) ~ as.character("NotDominant"))) %>% 
+  mutate_at(vars(DominantSpecies), ~case_when(
+    all(TPM == 0) ~ "NotExpressed", 
+    any(TPM > 0) ~ .)) %>% 
+  ungroup() %>% 
+
+  #spread() causes 4 lines per sample. Need to deduplicate
+  #So make NAs to zeros and collapse the rows using sum()
+  spread(transcript_id, TPM)  %>% 
+  group_by(Sample) %>%
+  mutate_at(vars(matches("^ENST|^PB")), ~replace(.,is.na(.),0)) %>%
+  mutate_at(vars(matches("^ENST|^PB")), sum) %>%
+  ungroup() %>% 
+  
+  #remove duplicated rows
+  filter(DominantSpecies != "NotDominant") %>%
+  filter(!duplicated(Sample)) %>% 
+  
+  #limit number of digits
+  mutate_at(vars(matches("^ENST|^PB")), ~round(., digits=5)) %>% 
+  
+  left_join(., select(FOLR1.samps,Sample,USI:AML_Subtype,Group,Tissue),
+            by="Sample") %>% 
+  left_join(., select(FOLR1.txIDs, transcript_id, transcript_type), 
+             by=c("DominantSpecies"="transcript_id")) %>% 
+  select(Sample,USI:Tissue,gene_name,transcript_type,
+         DominantSpecies, matches("^ENST"), -Rank)
+  
+
+  
+
+
+# dim(FOLR1.tx.TPM)
+# head(FOLR1.tx.TPM)
+options(scipen = 999)
+# table(FOLR1.tx.TPM$Group)
+
+
+# write.csv(FOLR1.tx.dom,file.path(PROJHOME, "2017.02.15_CBF-GLIS_DEG/2020.12.23_CBFGLIS_Models/TARGET_AML_GRCh38_KallistoQuant_FOLR1_transcript_Expression.csv"), row.names = FALSE)
+```
+
+
+
+```{r}
+summ.stats <-    FOLR1.tx.TPM %>% 
+  left_join(., select(FOLR1.samps,Sample,USI:AML_Subtype,Group,Tissue),
+            by="Sample") %>% 
+  group_by(AML_Subtype,transcript_id) %>%
+  summarize(Mean_TPM=mean(TPM),
+            Median_TPM=median(TPM),
+            SD_TPM=sd(TPM),
+            Max_TPM=max(TPM)) %>%
+  mutate_if(is.numeric, ~round(., digits = 2)) %>% 
+  ungroup()
+
+
+# summ.stats
+```
+
+
+```{r}
+FOLR1.Table <- FOLR1.tx.dom %>% 
+  group_by(AML_Subtype, DominantSpecies) %>% 
+  summarise(Number_of_Samples=n()) %>% 
+  ungroup() %>% 
+  group_by(AML_Subtype) %>% 
+  mutate(Percent_of_Samples=round(Number_of_Samples/sum(Number_of_Samples)*100, digits=2)) %>% 
+  ungroup() %>% 
+  arrange(AML_Subtype, desc(Percent_of_Samples)) %>% 
+  # mutate(AML_Subtype= gsub("AML", "AML, NOS", AML_Subtype)) %>% 
+  left_join(.,  summ.stats, by=c("DominantSpecies"="transcript_id", "AML_Subtype"))
+
+
+# FOLR1.Table
+# View(FOLR1.Table)
+# write.csv(FOLR1.Table, file.path(PROJHOME, "2017.02.15_CBF-GLIS_DEG/2020.12.23_CBFGLIS_Models/TARGET_AML_FOLR1_Dominant_Transcripts_Table.csv"), row.names = F)
+```
+
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+
+
+#Old Code
+
+```{r fig.width=15, fig.height=5}
+HH.Targets.samples <- ggplot(filter(gsva.res.TF.df,grepl("NBM|CBFA2T3-GLIS2", Comparisons)),
+       aes(x=Comparisons, y=Score, fill=Comparisons)) +
+  geom_jitter(alpha=1.0, aes(color=Comparisons)) +
+  geom_boxplot(alpha=0.3,outlier.shape = NA) +
+  # stat_compare_means(comparisons = my_comparisons[4:5]) +
+  labs(y="Enrichment Score", x="", title="Hedgehog Signalling Genes") +
+  
+  facet_wrap(~path, scales="free") +
+  scale_fill_manual(values=cc.cultures) +
+  scale_color_manual(values=cc.cultures) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 35, vjust=1, hjust=1),
+        strip.text = element_text(size=14))
+
+# pdf("Figures/TARGET_AML_CBFGLIS.pts_vs_NBM_ssGSEA_boxplot.pdf", height = 5, width = 10)
+HH.Targets.samples
+# dev.off()
+
+HH.Targets.cultures <- ggplot(filter(gsva.res.TF.df, !grepl("CD34_PB|NBM|CBFA2T3-GLIS2", Comparisons)),
+       aes(x=Comparisons, y=Score, fill=Comparisons)) +
+  ggbeeswarm::geom_quasirandom(aes(color=Comparisons)) +
+  geom_boxplot(alpha=0.3,outlier.shape = NA) +
+  
+  # ggrepel::geom_text_repel(aes(label=Label),
+  #                          point.padding = unit(1,"mm"),
+  #                          min.segment.length = unit(10,"mm"),
+  #                          size=3) +
+  
+  labs(y="Enrichment Score", x="", title="Hedgehog Signalling Genes") +
+  
+  facet_wrap(~path, scale="free") +
+  # stat_compare_means(comparisons = my_comparisons[-c(4:5)], method.args=list(alternative="less")) +
+  scale_fill_manual(values=cc.cultures) +
+  scale_color_manual(values=cc.cultures) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 35, vjust=1, hjust=1),
+        strip.text = element_text(size=14), 
+        plot.margin = margin(l=2.5, unit="cm"))
+
+
+# pdf("TARGET_AML_CBFGLIS.models_vs_Controls_ssGSEA__boxplot.pdf", height = 8, width = 20)
+HH.Targets.cultures
+# dev.off()
+```
+
+
+```{r}
+EC_Week6 <-  heatmap.samps %>%
+    filter(grepl("EC_Week1_GFP_CordBlood|EC_Week6_CBFGLIS_CordBlood", Comparisons)) %>% 
+    mutate(USI=Sample) %>%
+    set_rownames(.$Sample) %>% 
+    droplevels()
+
+levels(EC_Week6$Comparisons)
+
+# test1 <- gsva.res.all[grep("hsa.+tgf", rownames(gsva.res.all), ignore.case = T), EC_Week6$Sample]
+# test2 <- gsva.res.all[grep("hsa.+wnt", rownames(gsva.res.all), ignore.case = T), EC_Week6$Sample]
+# 
+# # test1
+# # test2
+# res1 <- wilcox.test(x=test1[grep("CBFA2T3", names(test))], y=test1[grep("GFP", names(test))], alternative = "two.sided", exact=TRUE)
+# res2 <- wilcox.test(x=test2[grep("CBFA2T3", names(test))], y=test2[grep("GFP", names(test))], alternative = "greater", exact=FALSE)
+# 
+# # res1
+# # res2
+
+EC_Week6_DE_GSEA <- DeGSEA::gsva_DE(gsva_matrix = gsva.res.all[grep("hsa", rownames(gsva.res.all)),EC_Week6$Sample],
+                              clinData=EC_Week6,
+                              col="Comparisons",
+                              p.value = 0.05)
+
+dim(EC_Week6_DE_GSEA$gene_sets)
+# write.csv(EC_Week6_DE_GSEA$gene_sets,"TARGET_AML_CBFGLIS.models_vs_GFP_ssGSEA_DE_Pathways.csv", row.names = FALSE)
+
+# EC_Week6_DE_GSEA$gene_sets %>%
+#   filter(grepl("Hedge|wnt|tgf",GeneSet, ignore.case = T))
+```

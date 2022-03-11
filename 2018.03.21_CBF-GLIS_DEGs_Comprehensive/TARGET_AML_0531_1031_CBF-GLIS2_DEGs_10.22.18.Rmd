@@ -1,0 +1,1717 @@
+---
+title: "CBFGLIS in 0531 and 1031"
+output: html_document
+---
+
+
+#Set-up
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', message = FALSE, fig.width = 10, fig.height = 10)
+knitr::opts_knit$set(root.dir = file.path(HOME,"2018.03.21_CBF-GLIS_DEGs_Comprehensive/"))
+options(stringsAsFactors = FALSE)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(readr)
+library(DeGSEA)
+library(ggplot2)
+getwd()
+```
+
+```{r}
+# source("~/scripts/conversion_scripts/GSEA_fmt_conversion_Function.r")
+# source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/R/DifferentialExpressionPipeline_01.07.19.r")
+# source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/R/in_progress/ggplot_Themes_Function.r")
+```
+
+"~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/DifferentialExpressionPipeline_7.05.18.r"
+  #The group by gene and collapseRows is for the case when the same ENSG identifier maps to 2 different ENSP IDs that both have unique entries in compartments db.
+    #it resolves the duplicate entries and retains the two ENSP IDs. 
+
+
+#Define Functions
+
+```{r}
+extract_anno_subset <- function(extract_DEGs.res){
+    #for use after extracting all the DEGs with Annotations. 
+    
+    if(is.null(dim(extract_DEGs.res))){
+      return("No DEGs")
+    }else{
+      df <- extract_DEGs.res %>%
+        dplyr::select(-Number_of_Transcripts,-Transcript_ID, -TM_Protein_Regions) %>% 
+        
+        #any gene with at least 1 TMhelix detected for  any of its transcripts, has a TMhelix.
+        group_by(gene) %>%
+        mutate(Predicted_Transmembrane_Structure = case_when(
+                      any(grepl("TM", Predicted_Transmembrane_Structure)) ~ "TMhelix",
+                      TRUE ~ Predicted_Transmembrane_Structure)) %>%
+        arrange(Cellular.Compartment_Membrane) %>%
+        filter( grepl("^[A-Z].+", Cellular.Compartment_Membrane) | (!duplicated(gene, fromLast = TRUE) )) %>%
+        ungroup()  %>% 
+        
+        group_by(gene) %>% 
+        mutate_at(vars(Ensembl_ProteinID:Cellular.Compartment_Receptors),
+                  funs(collapseRows(., uniq = TRUE, split = TRUE, sep="; "))) %>% 
+        filter(!duplicated(gene)) %>%
+        ungroup() %>% 
+        
+        arrange(desc(logFC))
+      
+      return(df)
+    }
+}
+```
+
+
+#Read in the clinical Data
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_2.12.20.csv")) #for backwards compatibility. 
+
+#The newest CDEs did have OS and EFS updated after the manuscript was completed. Keeping this older version consistency.
+# merged <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/Clinical/CDE/Merged/TARGET_AML_0531_1031_merged_CDEs_9.4.19.csv")
+
+merged <- merged %>%
+  filter(!is.na(USI) | USI != "Unknown") %>%
+  mutate(CBFA2T3.GLIS2=gsub("Intermediate","Yes", CBFA2T3.GLIS2)) %>%
+  set_rownames(.$TARGET.USI.1)
+
+head(merged[,1:5])
+dim(merged) #2179  138
+table(merged$CBFA2T3.GLIS2)
+```
+
+```{r}
+forAnno <- merged %>%
+  dplyr::select(USI,Cytogenetic.Category.1,Rare.Fusions,matches("trisomy"),M7_AML) %>% #-trisomy.20,-trisomy.8
+  
+  # mutate_at(vars(Cytogenetic.Category.1), funs(ifelse(grepl("Unknown",.), "OtherAML", .))) %>%
+  mutate_at(vars(M7_AML), funs(case_when(
+    grepl("Yes", .) ~ "M7_AML",
+    grepl("Unknown|No",.) ~ "OtherAML"))) %>%
+  
+  mutate_at(vars(Rare.Fusions), funs(case_when(
+    grepl("RUNX1.CBFA2T3", .) ~ "OtherAML",
+    grepl("NPM1.MLF1",.) ~ "OtherAML",
+    TRUE ~ .))) %>%
+
+  mutate(trisomies=pheno_bars(CDE=., 
+                              IDCol = "USI", 
+                              cols = grep("trisomy", colnames(.), value=TRUE))) %>%
+  
+  mutate_at(vars(trisomies), funs(Simplified.Trisomy=case_when(
+    grepl("trisomy.3", .) ~ "trisomy.3", #first trisomy 3 takes precedence, (most rare)
+    grepl("trisomy.21", .) ~ "trisomy.21", #then trisomy 21 (next most rare)
+    grepl("trisomy.19", .) ~ "trisomy.19", #finally. trisomy 19 takes precendence.
+    TRUE ~ .))) %>%
+  
+  mutate_at(vars(trisomies), funs(case_when(
+    grepl("[0-9]trisomy", .) ~ "MultipleTrisomies", #first trisomy 3 takes precedence, (most rare)
+    TRUE ~ .))) %>%
+  
+  dplyr::select(USI,Cytogenetic.Category.1, M7_AML,Rare.Fusions,Simplified.Trisomy) %>%
+  set_rownames(.$USI)
+
+head(forAnno)
+dim(forAnno) #1049    6
+```
+
+```{r}
+cc <- list(Cytogenetic.Category.1=c("Unknown"="navy", 
+                                "inv.16."="#7FC97F",
+                                "MLL"="#BEAED4",
+                                "t.8.21."="#FDC086",
+                                "Normal"="darkslategray1", 
+                                "Other"="khaki1"),
+           
+           Simplified.Trisomy=c("OtherAML"="navy",
+                       "trisomy.3"="red",
+                       "trisomy.21"="paleturquoise2",
+                       "trisomy.8"="orange2",
+                       "trisomy.19"= "lawngreen"),
+
+           Rare.Fusions=c("CBFA2T3.GLIS2"="red",
+                           "DEK.NUP214"="deepskyblue",
+                           "NUP98.KDM5A"="darkorchid1",
+                           "NUP98.NSD1"="green4", #darkolivegreen2
+                           "RBM15.MKL1"="gold2",
+                           # "RUNX1.CBFA2T3"="grey",
+                           # "NPM1.MLF1"="deeppink",
+                           "OtherAML"="navy"), 
+
+           M7_AML=c("M7_AML"="firebrick3",
+                    "OtherAML"="navy"))
+```
+
+
+This CDE came from "TARGET_AML_1031_0531_CBFGLIS_Survival_Analysis_10.19.2018.Rmd" which was a subset of the merged CDEs from "TARGET_Merge_1031_0531_Official_CDE.html"
+
+Don't use this one. Will use the one with the full cohort for RNAseq DE
+
+
+merged.elig <- read.csv("Survival_Analysis/TARGET_AML_0531_1031_merged_CDEs_forCBFLGIS_10.22.18.csv", row.names = 1)
+head(merged.elig[,1:5])
+dim(merged.elig) #1927  174
+
+forTodd <- merged.elig %>% 
+  # filter(grepl("AAML1031|AAML0531",Protocol)) %>% 
+  dplyr::select(Reg., Protocol, CBFA2T3.GLIS2, NUP98.NSD1, NUP98.KDM5A, RBM15.MKL1) %>% 
+  mutate_at(vars(CBFA2T3.GLIS2:RBM15.MKL1), funs(gsub("Intermediate", "Yes", .)))
+
+head(forTodd)
+write.csv(forTodd, "~/RNA_seq_Analysis/2018.03.21_CBF-GLIS_DEGs_Comprehensive/Survival_Analysis/TARGET_AML_CBFGLIS_2.8.2019.csv")
+lapply(forTodd[,-c(1:2)],table )
+
+
+#MRD in CBFGLIS positive
+
+```{r}
+CBFGLIS.pos <- merged %>% 
+  filter(CBFA2T3.GLIS2 == "Yes") %>% 
+  filter(grepl("1031|0531",Protocol))
+
+table(CBFGLIS.pos$CBFA2T3.GLIS2)
+# quantile(CBFGLIS.pos$MRD...at.end.of.course.1,na.rm = TRUE)
+# quantile(CBFGLIS.pos$MRD...at.end.of.course.2,na.rm = TRUE)
+
+# select(CBFGLIS.pos, USI, Protocol,CBFA2T3.GLIS2,MRD...at.end.of.course.1,MRD.at.end.of.course.1) %>% 
+#   arrange(MRD...at.end.of.course.1)
+median(CBFGLIS.pos$MRD...at.end.of.course.1, na.rm = T)
+range(CBFGLIS.pos$MRD...at.end.of.course.1, na.rm = T)
+```
+
+
+#Read in the Raw Counts 
+
+```{r}
+# cts.list <- readRDS("~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/TARGET_AML_1031_0531_Counts_List.RDS")
+
+# sum(colnames(cts.list$cts.hd.1031) %in% merged$TARGET.USI.1)
+# sum(colnames(cts.list$cts.ld.0531) %in% merged$TARGET.USI.1)
+# sum(colnames(cts.list$cts.hd.0531) %in% merged$TARGET.USI.1)
+```
+
+```{r}
+TPMs <- read_csv("~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/TARGET_AML_AAML1031_dupGenesRemoved_TPM.csv")
+TPMs <- column_to_rownames(TPMs,"X1")
+head(TPMs[,1:5])
+```
+
+```{r}
+forAnno <- forAnno %>%
+  filter(USI %in% colnames(TPMs)) 
+
+dim(forAnno)
+```
+
+
+
+#Read in the CTAs, Homeobox, and RTKs Gene Lists
+
+```{r}
+CTAs <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2017.06.23_DEGs_CTAs/CTAs/CTA_genes_found_in_low_depth_RNA_seq.csv")
+head(CTAs)
+```
+
+```{r}
+homeobox <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/HoxgenesList.csv", stringsAsFactors = FALSE)
+
+head(homeobox)
+```
+
+```{r}
+RTK <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/RTKs_GeneList_Human.csv")
+
+head(RTK)
+```
+
+
+#Differential Expression Analysis
+
+##CBFGLIS vs Other AML
+
+
+```{r fig.height=10, fig.width=10}
+
+# pdf("TARGET_AML_0531_1031_CBFGLIS_vs_OtherAML_DEGs_Heatmap_10.23.2018.pdf", height = 10, width = 10)
+DEGs <- lapply(cts.list, twoGroups_DEGs, 
+                    clinData=merged,
+                    col="CBFA2T3.GLIS2",
+                    ref="No",
+                    logCPM=FALSE,
+                    BM=FALSE,
+                    GOI=NULL,
+                    method="ward.D2") 
+
+# dev.off()
+```
+
+```{r}
+# saveRDS(DEGs,"TARGET_AML_AllCohorts_CBFGLISvsOtherAML_DEGs_10.23.18.RDS")
+DEGs <- readRDS("DEGs/TARGET_AML_AllCohorts_CBFGLISvsOtherAML_DEGs_10.23.18.RDS")
+```
+
+```{r}
+# summary(DEGs)
+```
+
+```{r}
+lapply(DEGs, function(x) table(x$phenovector))
+# DEGs$cts.hd.1031$phenovector %>%
+#   grep("GroupA",.,value=TRUE)
+```
+
+with PAXKGH: DEGs 1,583 in HD.0531; 2,650 in LD.0531; 3,519 in HD.1031
+
+```{r}
+DEGs.list <- lapply(DEGs, extract_DEGs)
+
+sum(DEGs$cts.hd.1031$DE$DE$logFC > 1)
+sum(DEGs$cts.hd.1031$DE$DE$logFC < -1)
+
+lapply(DEGs.list, dim) #1,619 in HD.0531; 2,650 in LD.0531; and 3,711 in HD.1031
+# lapply(DEGs.list, head)
+```
+
+The basics are that using 5% threshold is very stringent. It fitlers off BMP4, which is a marker of CBFGLIS
+dysregulation. 
+
+However, lowering the threshold to 3% increases the # of DEGs by ~400 genes. Which may just be introducing noise. I know that BMP2 has a very low expression in TPMs (something like max of 2 TPMs).So it seems worth it to keep the more stringent filter at 5%. 
+
+
+```{r}
+DEGs.1031.anno <- gene_protein_anno(df=DEGs.list$cts.hd.1031)
+head(DEGs.1031.anno)
+dim(DEGs.1031.anno) #15,738    17
+# write.csv(DEGs.1031.anno, "TARGET_AML_1031_CBFGLIS_vs_OtherAML_DEGs_Anno_Full_3.22.19.csv", row.names = FALSE)
+```
+
+Now 17072    16 
+There are 851 upregulate cell surface/adhesion molecule genes from 789 originally. Only 17 were removed. 
+
+```{r}
+# DEGs.anno.sub <- extract_anno_subset(extract_DEGs.res = DEGs.1031.anno)
+DEGs.anno.sub <- read.csv("DEGs/TARGET_AML_1031_CBFGLIS_vs_OtherAML_DEGs_updateAnno.csv")
+dim(DEGs.anno.sub)
+head(DEGs.anno.sub)
+# write.csv(DEGs.anno.sub, "TARGET_AML_1031_CBFGLIS_vs_OtherAML_DEGs_updateAnno_filt3_3.22.19.csv", row.names = FALSE)
+```
+
+
+```{r}
+DEGs.list.Anno <- lapply(DEGs, extract_DEGs, anno=TRUE)
+lapply(DEGs.list.Anno, dim)
+# lapply(DEGs.list.Anno, head)
+
+DEGs.Anno.Sub <- lapply(DEGs, extract_DEGs, anno=TRUE, geneLevel=TRUE)
+lapply(DEGs.Anno.Sub, dim)
+# lapply(DEGs.Anno.Sub, head)
+# lapply(names(DEGs.Anno.Sub), function(x) write.csv(DEGs.Anno.Sub[[x]], paste0("TARGET_AML_",x, "_CBFGLIS_vs_OtherAMLDEGs.csv")))
+```
+
+
+```{r fig.height=5, fig.width=7}
+MDSplots <- lapply(DEGs, extract_MDS)
+
+MDSplots
+
+# try(
+#   lapply(names(MDSplots), function(x) ggsave(plot = MDSplots[[x]], file=paste0("TARGET_AML_",x,"_CBFGLISvsOtherAML_MDS_07.24.2018.tiff"),
+#                                            height = 6, width = 8, device = "tiff", dpi = 600, units = "in")))
+```
+
+
+```{r fig.height=5, fig.width=7}
+PCAplots <- lapply(DEGs, extract_PCA)
+
+PCAplots
+
+# try(
+#   lapply(names(PCAplots), function(x) ggsave(plot = PCAplots[[x]], file=paste0("TARGET_AML_",x,"_CBFGLISvsOtherAML_PCA_07.24.2018.tiff"),
+#                                            height = 6, width = 8, device = "tiff", dpi = 600, units = "in")))
+```
+
+
+```{r}
+d.fdr <- dge_dendrograms(expnData = cts.list$cts.hd.1031,
+                         pheno = phenovector,
+                         genelist = DEGs.list$cts.hd.1031$gene,
+                         createDGE=TRUE,
+                         add.count= 0.01, #add.count here at 1.0 vs 0.01 makes a huge difference.....
+                         method = "ward.D2")
+
+# head(d.fdr$TMMCPM[,1:5])
+# head(DEGs$cts.hd.1031$DE$Voom$E[rownames(d.fdr$TMMCPM),1:5])
+```
+
+```{r fig.height=6, fig.width=14}
+ha.fdr_0.001 <- create_HA_Labs_Hmap(expn = d.fdr$TMMCPM, 
+                                geneList = degs.fdr$gene, 
+                                goi = NULL, 
+                                cc=cc[3], 
+                                CDE=forAnno, 
+                                cols=names(forAnno)[4])
+
+#DEGs$cts.hd.1031$DE$Voom$E[degs.fdr$gene,names(phenovector)]
+hapmap.fdr_0.001 <- ComplexHmap(mat=d.fdr$TMMCPM, 
+                                hmap_anno_obj = ha.fdr_0.001$annoColumn,
+                                dge_dendrograms.res = d.fdr,
+                                colorbar.height = 2)
+
+# tiff("TARGET_AML_1031_CBFGLIS_vs_Others_AllDEGs.tiff", height = 6, width = 14,units = "in", res=600 )
+# draw(hapmap.fdr_0.001)
+# dev.off()
+```
+
+```{r}
+#using 0.5 as teh prior.count of 0.5 does not improve clustering of the fusion-positive...
+d.voom <-  dge_dendrograms(expnData = DEGs$cts.hd.1031$DE$Voom$E,
+                         pheno = phenovector,
+                         genelist = DEGs.list$cts.hd.1031$gene,
+                         createDGE=FALSE,
+                         log=FALSE,
+                         method = "ward.D2")
+
+head(d.voom$TMMCPM[,1:5])
+head(DEGs$cts.hd.1031$DE$Voom$E[rownames(d.voom$TMMCPM),1:5])
+```
+
+```{r}
+basicHeatmap(ExpnMatrix =  d.voom$TMMCPM,
+             geneDend = d.voom$c2, 
+             sampleDend = d.voom$c1, 
+             colors = ifelse(phenovector == "GroupA","red","navy"),
+             title = "CBFLGIS in AAML1031")
+```
+
+
+##CBFGLIS vs NBM 
+
+```{r fig.height=10, fig.width=10}
+
+# pdf("TARGET_AML_0531_1031_CBFGLIS_vs_NBM_DEGs_Heatmap_10.23.2018.pdf", height = 10, width = 10)
+DEGs.NBM <- lapply(cts.list[-1], twoGroups_DEGs, 
+                    clinData=merged,
+                    col="CBFA2T3.GLIS2",
+                    ref="No",
+                    logCPM=FALSE,
+                    BM=TRUE,
+                    GOI=NULL,
+                    method="ward.D2")
+
+# dev.off()
+```
+
+```{r}
+# saveRDS(DEGs.NBM,"TARGET_AML_AllCohorts_CBFGLISvsNBM_DEGs_10.23.18.RDS")
+DEGs.NBM <- readRDS("DEGs/TARGET_AML_AllCohorts_CBFGLISvsNBM_DEGs_10.23.18.RDS")
+```
+
+```{r}
+DEGs.NBM.Anno.Sub <- lapply(DEGs.NBM, extract_DEGs, anno=TRUE, geneLevel=TRUE)
+
+lapply(DEGs.NBM.Anno.Sub, dim)
+lapply(DEGs.NBM.Anno.Sub, head)
+
+# lapply(names(DEGs.NBM.Anno.Sub), function(x) write.csv(DEGs.NBM.Anno.Sub[[x]], paste0("TARGET_AML_",x, "_CBFGLIS_vs_NBM_DEGs.csv")))
+```
+
+
+### Visualize genes of interest
+
+```{r}
+log2CPM.melt <- DEGs$cts.hd.1031$DE$Voom$E %>%
+  as.data.frame() %>%
+  rownames_to_column("gene") %>%
+  gather(USI,log2.CPM, -gene) %>%
+  inner_join(., dplyr::select(merged, USI=TARGET.USI.1, CBFA2T3.GLIS2), by="USI")
+
+head(log2CPM.melt)
+```
+
+```{r}
+DEGs.list$cts.hd.1031 %>% 
+  filter(gene %in% CTAs$geneSymbol) %>%
+  filter(logFC > 1) #8 up reg ve other AML
+```
+
+```{r}
+ DEGs.anno.sub %>%
+   filter(gene %in% RTK$Approved.Symbol)
+```
+
+```{r}
+DEGs.list$cts.hd.1031%>%
+  filter(gene %in% homeobox$Symbol.Locus | gene %in% homeobox$Name | 
+           gene %in% c("BP1|GSH2|CDX1|PDX")) %>% #16
+  arrange(desc(logFC),gene) #%>%
+  # filter(grepl("HOXB", gene))
+```
+
+```{r}
+ETS.Family <- read.csv("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/ETS transcription factor family_HGNC.csv")
+
+# head(ETS.Family)
+
+DEGs.list$cts.hd.1031%>%
+  filter(gene %in% ETS.Family$Approved.Symbol | grepl("BMP|TGFB|SMAD|MECOM", gene)) %>%
+  arrange(desc(logFC), gene)# no encode data for any o these...
+```
+
+```{r}
+GABRE.TFBind <- read.csv("TF_Binding_Sites_Promoter_GABRE.csv") #%>%
+  # filter(X..of.experiments.that.support.TF.binding > 1)
+# head(GABRE.TFBind)
+# dim(GABRE.TFBind) #15
+
+
+DEGs.list$cts.hd.1031 %>%
+  # filter(gene %in% GABRE.TFBind$factor) %>%
+  inner_join(., GABRE.TFBind, by=c("gene"="factor"))
+```
+
+```{r}
+hox.cts <- log2CPM.melt %>%
+  filter(gene %in% DEGs.list$cts.hd.1031$gene) %>%
+  filter(gene %in% homeobox$Symbol.Locus | gene %in% homeobox$Name ) 
+
+ggplot(hox.cts, aes(x=CBFA2T3.GLIS2, y=log2.CPM, fill=CBFA2T3.GLIS2, color=CBFA2T3.GLIS2)) +
+  labs(y="Log2(CPM+0.5)", title="Homeoboxes in CBFA2T3.GLIS2") +
+  geom_jitter(alpha=0.5, color="black") +
+  geom_boxplot(outlier.shape = NA, alpha=0.7) +
+  facet_wrap(facets = ~ gene, scales = "free") +
+  
+  scale_color_manual(values=c("Yes"="lightgrey", "No"="lightgrey")) +
+  scale_fill_manual(values=c("Yes"="darkred", "No"="navy")) +
+  theme_bw() +
+  
+  theme(strip.background = element_rect(color="white",fill = "white"),
+        strip.text = element_text(size=16))
+```
+
+```{r}
+df <- log2CPM.melt %>%
+  filter(gene %in% c("PTK2", "ITGA2", "SRC", "ITGA2", "ITGB3", "")) 
+
+ggplot(df, aes(x=CBFA2T3.GLIS2, y=log2.CPM, fill=CBFA2T3.GLIS2, color=CBFA2T3.GLIS2)) +
+  labs(y="Log2(CPM+0.5)", title="") +
+  geom_jitter(alpha=0.5, color="black") +
+  geom_boxplot(outlier.shape = NA, alpha=0.7) +
+  facet_wrap(facets = ~ gene, scales = "free") +
+  
+  scale_color_manual(values=c("Yes"="lightgrey", "No"="lightgrey")) +
+  scale_fill_manual(values=c("Yes"="darkred", "No"="navy")) +
+  theme_bw() +
+  
+  theme(strip.background = element_rect(color="white",fill = "white"),
+        strip.text = element_text(size=16), 
+        text = element_text(size=14))
+```
+
+```{r}
+HH <- read.csv("~/RNA_seq_Analysis/0000.00.01_GSEA_geneSets_gmt/kegg_MdbSig/Hedgehog_MSigDB.csv", stringsAsFactors = FALSE)[-1,]
+```
+
+```{r}
+HH.1031 <- DEGs.list$cts.hd.1031 %>%
+  filter(gene %in% HH) %>%
+  dplyr::select(gene,logFC,AveExpr,adj.P.Val) %>%
+  filter(logFC > 1) %>%
+  mutate(Adjusted.P.Value=case_when(
+    round(adj.P.Val, digits = 3) < 0.001 ~ "< 0.001",
+    TRUE ~ as.character(round(adj.P.Val, digits = 3))))
+
+HH.1031
+# write.csv(HH.1031, "TARGET_AML_1031_HH_SignalingGenes_DEGs.csv", row.names = FALSE)
+```
+
+
+```{r}
+DEGs.list$cts.ld.0531 %>%
+  filter(gene %in% HH)
+```
+
+```{r}
+DEGs.list$cts.hd.0531 %>%
+  filter(gene %in% HH)
+```
+
+
+
+#Examine Output of GAGE GSEA 
+
+
+## Vs OtherAML 
+
+```{r}
+res <- dir("GAGE/RData/", pattern = ".RData")
+# res
+```
+
+```{r}
+res.AML <- list()
+for (file in res){
+  # print(file)
+  name <- gsub(".+vs_(OtherAML.+)\\.RData", "\\1", file) %>%
+    gsub("_Set.+", "", .)
+ 
+  res.AML[[name]] <- get(load(paste0("GAGE/RData/",file)))
+}
+
+rm(list = ls(pattern = "GSA"))
+
+```
+
+
+```{r}
+res.1031 <- lapply(res.AML, `[[`, 3)
+
+NCAM1.Ints <- res.1031$OtherAML_expn_C2.All_11.23.18$essSets.Up$coreGeneSets$REACTOME_NCAM1_INTERACTIONS %>%
+  .[order(.)]
+
+NCAM1.Ints
+# res.1031$OtherAML_expn_C2.All_11.23.18$essSets.Up$coreGeneSets$REACTOME_NCAM_SIGNALING_FOR_NEURITE_OUT_GROWTH
+# saveRDS(res.1031, "TARGET_AML_1031_CBFGLIS_vs_OtherAML_GAGE.RDS")
+
+DEGs.list$cts.hd.1031 %>%
+  filter(gene %in% NCAM1.Ints)
+```
+
+
+```{r}
+#Save only 1031 results to a file
+# for (i in 1:length(res.AML)){
+#   comp <- names(res.AML)[i]
+#   filename <- paste0("TARGET_AML_1031_CBGLIS_vs_", comp, "_GAGE_SigPaths.csv")
+#   print(filename)
+#   
+#   if(grepl("_expn_",filename)){
+#     
+#     res.1031.up <- res.AML[[i]][["cts.hd.1031"]]$SigPaths
+#     
+#     res.1031.dn <- res.AML[[i]][["cts.hd.1031"]]$gsa$less
+#     idx.dn <- res.1031.dn[,4] < 0.1
+#     res.1031.dn <- res.1031.dn[idx.dn,]
+#     
+#   }else{
+#     res.1031.up <- res.AML[[i]][["cts.hd.1031"]]$SigPaths 
+#     res.1031.dn <- data.frame() #dummy to prevent overwriting 
+#   }
+# 
+#   if(nrow(res.1031.up) >= 1){
+#     write.csv(res.1031.up, gsub("GAGE_", "GAGE_UpReg_",filename))
+#   }
+# 
+#   if(nrow(res.1031.dn) >= 1){
+#     write.csv(res.1031.dn, gsub("GAGE_", "GAGE_DownReg_",filename))
+#   }
+# }
+```
+
+```{r}
+# res.AML$OtherAML_expn_MSigDB_Hallmark_10.23.18$cts.hd.1031$SigPaths[,1:5]
+# res.AML$OtherAML_expn_HSA.KEGG_w.Diseases_11.16.18$cts.hd.1031$SigPaths[,1:5]
+```
+
+```{r}
+C2 <- get(load("GAGE/RData/TARGET_AML_hd.1031_CBFGLIS_vs_OtherAML_expn_C2.All_11.23.18.RData"))
+
+# C2$cts.hd.1031$essSets.Up$essentialSets
+C2$cts.hd.1031$essSets.Up$coreGeneSets$REACTOME_NCAM1_INTERACTIONS
+```
+
+```{r}
+C2$cts.hd.1031$SigPaths.Up %>% 
+  as.data.frame() %>%
+  rownames_to_column("Path") %>% 
+  filter(grepl("NCAM1", Path))
+```
+
+```{r fig.height=3, fig.width=5}
+hist(C2$cts.hd.1031$gsa$stats["REACTOME_NCAM1_INTERACTIONS",], breaks = seq(-1,3,by=0.25))
+```
+
+
+##heatmap with the pathways 
+
+```{r}
+library(pheatmap)
+```
+
+```{r}
+#Needed to select the best pathways for the heatmap. will update GAGE function to do this. 
+library(gage)
+library(gageData)
+
+    #Load the kegg human datasets
+    data("kegg.gs")
+    # data("go.sets.hs")
+    data("egSymb")
+    
+    #create objects to hold the information from the datasets loaded above
+    kg.hsa=kegg.gsets("hsa")
+    #sig = signaling, met = metabolic pathways.
+    kegg.gs=kg.hsa$kg.sets[kg.hsa$sigmet.idx]
+    #convert to gene symbols
+    kegg.gs.sym <- lapply(kegg.gs, eg2sym)
+    
+```
+
+
+
+```{r}
+# kegg <- res.AML$OtherAML_expn_C2.KEGG_10.23.18$cts.hd.1031
+# kegg <- res.1031$OtherAML_expn_HSA.KEGG_w.Diseases_11.23.18
+kegg <- get(load("GAGE/RData/TARGET_AML_hd.1031_CBFGLIS_vs_OtherAML_expn_HSA.KEGG_w.Diseases_11.23.18.RData"))$cts.hd.1031
+```
+
+```{r}
+Kegg.essSets.Up <- kegg$essSets.Up$essentialSets 
+sig <- grep("sign", Kegg.essSets.Up, value=TRUE, ignore.case = TRUE)
+ad <- grep("ECM|adhesion|junc", Kegg.essSets.Up, value=TRUE, ignore.case = TRUE)
+
+#only signalling and adhesion gene-sets for ease of interpretibility
+up <- kegg$SigPaths.Up[c(sig,ad),1:5] 
+up[,"q.val"]  <- round(up[,"q.val"], digits = 3)
+up <- up[up[,"q.val"] <= 0.001,]
+up
+
+```
+
+```{r}
+Kegg.essSets.Dn <- kegg$essSets.Dn$essentialSets 
+sig <- grep("sign", Kegg.essSets.Dn, value=TRUE, ignore.case = TRUE)
+ad <- grep("ECM|adhesion|junc", Kegg.essSets.Dn, value=TRUE, ignore.case = TRUE)
+
+dn <- kegg$SigPaths.Dn[Kegg.essSets.Dn[c(1:2,4:8)],1:5] #only signalling and metabolic gene-sets for ease of interpretibility
+dn[,"q.val"]  <- round(dn[,"q.val"], digits = 3)
+dn <- dn[dn[,"q.val"] <= 0.001,]
+# dn
+# head(dn)
+# dim(dn) #8 with FDR < 0.001
+```
+
+```{r fig.height=8, fig.width=20}
+# col <-  colorRampPalette(rev(brewer.pal(n = 5, name ="RdYlBu")))(299)
+len <- 299
+col <- colorRampPalette(c("deepskyblue4", "deepskyblue3", "deepskyblue2", "deepskyblue1",
+                          "white","red1", "red2", "red3", "red4"))(n=len)
+
+paths <- c(rownames(up), rownames(dn))
+stat <- kegg$gsa$stats[paths, 2:ncol(kegg$gsa$stats)] #ranges from -5.4 to 4.5
+
+Breaks <- c(seq(min(stat), 0, length.out=ceiling(len/2) + 1), 
+              seq(max(stat)/len, max(stat), length.out=floor(len/2)))
+
+# q.val <- as.character(c(up[,4],dn[,4]))
+# q.val <- ifelse(q.val!="0", paste("FDR =", q.val), "FDR < 0.001")
+labs <- gsub("KEGG_|hsa[0-9]{5} ", "", paths ) %>% gsub("_"," ", .) #%>% paste0(.,", ", q.val )
+ 
+anno.col <- merged %>%
+  filter(USI %in% names(DEGs$cts.hd.1031$phenovector)) %>%
+  filter(CBFA2T3.GLIS2=="Yes") %>%
+  dplyr::select(USI,M7_AML) %>%
+  column_to_rownames("USI")
+
+# head(anno.col)
+```
+
+```{r fig.height=10, fig.width=14.25}
+# tiff("TARGET_AML_1031_CBFGLIS_vs_OtherAML_GAGE_TestStat_Heatmap.tiff", height = 9, width=14.25, res=600, units="in")
+pheatmap::pheatmap(mat=stat,
+                   color=col,
+                   scale = "none",
+                   breaks = Breaks,
+                   cluster_rows=FALSE,
+                   cluster_cols = TRUE,
+                   clustering_method="ward.D2",
+                   clustering_distance_cols="euclidean",
+                   kmeans_k = NA,
+                   # annotation_col = anno.col,
+                   # annotation_colors = list(M7_AML=c("Yes"="firebrick4","No"="red")),
+                   gaps_row=7,
+                   # cutree_cols = 2,
+                   labels_row = labs,
+                   fontsize = 26,
+                   fontsize_number = 12,
+                   gp= grid::gpar(col="blue"),
+                   show_colnames=FALSE,
+                   display_numbers=TRUE,
+                   border_color="black",
+                   number_format="%.1f",
+                   number_color="black")
+# dev.off()
+```
+
+
+## Examine the other pathways of interest
+
+```{r}
+core.sets<- kegg$essSets$essentialSets
+
+DEGs.list$cts.hd.1031%>% 
+  filter(gene %in% kegg$coreGenes[[7]])
+sapply(kegg$coreGenes, function(x) grep("TGF-beta", x))
+```
+
+```{r}
+C2 <- res.AML$OtherAML_expn_C2.All_10.23.18$cts.hd.1031
+C2.paths <- C2$SigPaths 
+reactome <- C2.paths %>%
+  as.data.frame() %>%
+  rownames_to_column("Pathway") %>%
+  filter(grepl("REACTOME", Pathway)) %>%
+  filter(grepl("NCAM1", Pathway))
+
+reactome
+```
+
+```{r}
+ncam1 <- lapply(C2$coreGenes,function(x) grep("REACTOME_NCAM1_INTERACTIONS",x))
+NCAM1.interactions <- C2$coreGenes[sapply(ncam1,length) >0]
+```
+
+```{r}
+DEGs.list$cts.hd.1031 %>%
+  filter(gene %in% NCAM1.interactions[[1]])
+```
+
+
+
+#Heatmap with Cell-Adhesion Molecules 
+
+```{r}
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/R/Heatmaps_Function.r")
+library(RColorBrewer)
+library(viridis)
+library(wesanderson)
+```
+
+```{r}
+DEGs.anno.sub <- read.csv("DEGs/TARGET_AML_1031_CBFGLIS_vs_OtherAML_DEGs_updateAnno.csv")
+All.Cell.Surface <- DEGs.anno.sub %>%
+  filter(!grepl("^$", Cellular.Compartment_Membrane)) %>% 
+  filter(adj.P.Val < 0.001, logFC > 1) 
+
+dim(All.Cell.Surface) #789 genes
+quantile(All.Cell.Surface$logFC,probs = seq(0,1,length.out = 11), type=5)
+# write.csv(All.Cell.Surface,"CBFGLIS_vs_Others_AllCellSurfaceGenes_3.20.19.csv", row.names = FALSE)
+```
+
+from 789 to 730 using GRCh38 and GRCh37
+
+```{r}
+UpReg.CellSurface <- All.Cell.Surface %>%
+  filter(adj.P.Val < 0.001,logFC >= 5.204868 ) %>% #90th percentile of highest DEGs
+  arrange(desc(logFC))
+
+# head(UpReg.CellSurface)
+dim(UpReg.CellSurface) #79 genes
+range(UpReg.CellSurface$logFC) #  5.214825 11.123043
+# write.csv(UpReg.CellSurface, "CBGLIS_vs_OtherAML_Highest_CellSurfaceGenes_3.20.19.csv", row.names = FALSE)
+```
+
+```{r}
+goi <- c("HHIP","NCAM1","BMP2","GABRE","CACNB2", "SLITRK5")
+expn <- DEGs$cts.hd.1031$DE$Voom$E[UpReg.CellSurface$gene,names(DEGs$cts.hd.1031$phenovector)]
+
+anno <- create_HA_Labs_Hmap(CDE = forAnno, #c(1,3:4)
+                            expn = expn, 
+                            geneList = UpReg.CellSurface$gene,
+                            goi = goi, 
+                            cc = cc, #[3:4]
+                            cols=names(forAnno)[-1]) #[-c(1:2,5)]
+names(anno)
+```
+
+```{r}
+anno.full <- create_HA_Labs_Hmap(CDE = forAnno, #c(1,3:4)
+                            expn = expn, 
+                            geneList = UpReg.CellSurface$gene,
+                            goi = UpReg.CellSurface$gene, 
+                            cc = cc,
+                            cols=names(forAnno)[-1]) #-c(1:2,5)
+names(anno.full)
+```
+
+
+```{r}
+hmap <- ComplexHmap(mat = expn,
+                    name = "CBFA2T3.GLIS2", 
+                    scale = TRUE, 
+                    threshold = FALSE, 
+                    hmap_anno_obj = anno$annoColumn, 
+                    # split=3,
+                    colorbar.height = 3.5)
+```
+
+```{r fig.width=14, fig.height=10}
+# tiff("TARGET_AML_1031_CBFGLIS_vs_Others_complexHeatmap_3.15.19.tiff", height = 10, width =14, units = "in", res=600)
+draw(hmap + anno$geneLabels)
+# dev.off()
+```
+
+```{r fig.width=18, fig.height=14}
+hmap.cut <- ComplexHmap(mat = expn,
+                    name = "CBFA2T3.GLIS2", 
+                    scale = TRUE, 
+                    threshold = FALSE,
+                    colorbar.height = 2,
+                    # split=3,
+                    hmap_anno_obj = anno.full$annoColumn)
+
+# tiff("TARGET_AML_1031_CBFGLIS_vs_Others_HighestUpReg_CellSurface_split.tiff", height = 18, width = 14, res=200, units = "in")
+draw(hmap.cut + anno.full$geneLabels)
+```
+
+```{r}
+expn2 <- DEGs$cts.hd.1031$DE$Voom$E[All.Cell.Surface$gene,names(DEGs$cts.hd.1031$phenovector)]
+
+anno2 <- create_HA_Labs_Hmap(CDE = forAnno,
+                            expn = expn2, 
+                            geneList = All.Cell.Surface$gene,
+                            goi = goi, 
+                            cc = cc,
+                            cols=names(forAnno)[-1])
+
+
+hmap2 <- ComplexHmap(mat = expn2,
+                    name = "CBFA2T3.GLIS2", 
+                    scale = TRUE, 
+                    threshold = FALSE, 
+                    hmap_anno_obj = anno2$annoColumn)
+
+```
+
+
+```{r fig.width=14, fig.height=6}
+# tiff("TARGET_AML_1031_CBFGLIS_vs_Others_AllUpReg_CellSurfaceGenes_complexHeatmap_3.15.19.tiff",height = 6, width = 14, units = "in", res=600)
+draw(hmap2 + anno2$geneLabels)
+# dev.off()
+```
+
+```{r}
+All.Cell.Surface %>%
+  filter(gene %in% RTK$Approved.Symbol) %>%
+  head(., n=100)
+  # write.csv(., "CBFGLIS_vs_OtherAML_UpReg_RTKs_3.15.19.csv", row.names = FALSE)
+```
+
+
+
+
+#Unspervised Clustering with Non-specific Genes 
+
+```{r}
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/clusterAnalysis_Function.r")
+library(gridExtra)
+```
+
+```{r}
+vst <- DEGs$cts.hd.1031$PCA$vst
+range(assay(vst)) #4.244103 27.133883, non-negative expression. in the family of log2 
+dim(assay(vst))
+
+vst
+```
+
+##PCA on Most Varied Genes
+
+```{r  }
+pca.list <- list()
+for(i in 1:10){
+  
+  n <- i*1000
+  print(n)
+  pca.plot <- plotPCA.DESeq.mod(object = vst, intgroup = "phenovector", ntop = n)
+  pca.list[[paste(n,"VarGenes",sep="_")]] <- pca.plot
+}
+
+```
+
+```{r}
+names(pca.list)
+```
+
+```{r fig.height=5, fig.width=14}
+#PC1 and PC2 are not sufficient to separate the fusion positive vs fusion negative. for 1000-10,000 most varied genes
+pca.m <- marrangeGrob(grobs=pca.list, ncol=2, nrow=1)
+pca.m
+```
+
+
+
+##MDS on Most Varied Genes
+
+```{r}
+library(vegan)
+#pheno
+phenovector <- DEGs$cts.hd.1031$phenovector
+
+# calculate the variance for each gene
+rv <- rowVars(assay(vst))
+```
+
+
+```{r }
+mds.list <- list()
+for (i in 1:10){
+  n <- i*1000
+  print(n)
+  # select the ntop genes by variance
+  sel <- order(rv, decreasing=TRUE)[seq_len(min(n, length(rv)))]
+  
+  e <- t(assay(vst)[sel,names(phenovector)])
+  
+  PCoA <- capscale( e ~ 1, distance = "bray", add=TRUE)
+  
+  scores <- data.frame(scores(PCoA, display="sites"), 
+                         Group=phenovector) 
+    
+    
+  mds.p <- ggplot(scores, aes(x=MDS1, MDS2)) +
+      geom_point(aes(color=scores[,"Group"]), size=3) 
+  
+  mds.list[[paste(n,"VarGenes",sep="_")]] <- mds.p
+
+}
+
+names(mds.list)
+```
+
+
+```{r fig.height=5, fig.width=14}
+mds.m <- marrangeGrob(grobs=mds.list, ncol=2, nrow=1)
+mds.m
+```
+
+
+##Heatmap with top varied genes
+
+
+```{r}
+# for ()
+```
+
+
+```{r}
+sel <- order(rv, decreasing=TRUE)[seq_len(min(5000, length(rv)))]
+  
+mat <- assay(vst)[sel,names(phenovector)]
+```
+
+```{r fig.height=6, fig.width=11}
+ha.n5000 <- create_HA_Labs_Hmap(expn = mat, 
+                                geneList = 1:5000, 
+                                goi = NULL, 
+                                cc=cc[3], 
+                                CDE=forAnno, 
+                                cols=names(forAnno)[4])
+
+hmap.n5000 <- ComplexHmap(mat=mat, hmap_anno_obj = ha.n5000$annoColumn, cluster.method="complete")
+
+draw(hmap.n5000)
+```
+
+
+
+
+# CBF/GLIS-like Group
+
+```{r}
+source(file.path(SCRIPTS,"survival_analysis", "Survplot_Functions_2018.10.24.r"))
+```
+
+```{r fig.height=4, fig.width=16}
+CBFGLIS.d <- column_dend(hmap)
+CBFGLIS.Ord <- column_order(hmap)
+CBFGLIS.USIs.Ord <- colnames(expn)[CBFGLIS.Ord]
+
+# str(CBFGLIS.d) #OK
+plot(CBFGLIS.d)
+# head(CBFGLIS.USIs.Ord)
+```
+
+```{r}
+d.groups <- colorDends_Groups(dendrogram=CBFGLIS.d, 
+                              phenovector=DEGs$cts.hd.1031$phenovector,
+                              colorcodes = c("GroupA"="red", "GroupB"="black"),
+                              branchCol = c("black","black","red"),
+                              h=100)
+```
+
+```{r fig.height=3, fig.width=16}
+# tiff("GBFGLIS_vs_OtherAML_HighestCellSurface_ColorDend.tiff", height = 4, width = 16, units = "in", res=300)
+par(mfrow=c(1,1), cex=0.1, mar=c(7.5, 8.5, 9.5, 1), pty="m")
+    plot(d.groups$dend,
+         xlab = " ", ylab=" ",  main=" ",
+         axes=TRUE,
+         type = "rectangle",
+         cex.axis=10,
+         horiz = FALSE) 
+par(cex=0.8, cex.main = 1, cex.lab = 0.85)
+# dev.off()
+```
+
+```{r fig.height=3, fig.width=14}
+par(mfrow=c(1,1), cex=0.75, mar=c(4.5, 4.5, 4.5, 2), pty="m")
+    plot(d.groups$split_dends[[3]], #group 3 is the glislike
+         xlab = " ", ylab=" ",  main=" ",
+         axes=TRUE,
+         type = "rectangle",
+         cex.axis=1.2,
+         horiz = FALSE)
+par(cex=0.8, cex.main = 1, cex.lab = 0.85)
+```
+
+```{r}
+library(compareGroups)
+```
+
+```{r}
+glis.like <- data.frame(CBFGLIS_Group_Number=d.groups$groups, 
+                 USI=unlist(d.groups$group_labels)) %>%
+  left_join(., merged, by=c("USI")) %>%
+  mutate(CBFGLIS.like=case_when(
+    CBFGLIS_Group_Number == 3 & CBFA2T3.GLIS2 != "Yes" ~ "CBF/GLIS-like",
+    CBFA2T3.GLIS2 == "Yes" ~ "CBFA2T3-GLIS2",
+    CBFGLIS_Group_Number != 3 & CBFA2T3.GLIS2 != "Yes" ~  "OtherAML")) %>%
+  mutate(CBFGLIS.like=factor(CBFGLIS.like,
+                             levels=c("OtherAML","CBFA2T3-GLIS2", "CBF/GLIS-like"))) %>%
+  dplyr::select(USI,Reg., CBFGLIS_Group_Number, ISCN,
+         Protocol, CBFA2T3.GLIS2, Age.Category, Age.Yrs,
+         Gender, Race, Ethnicity, 
+         WBC.at.Diagnosis, Bone.marrow.leukemic.blast.percentage...., Peripheral.blasts....,
+         EMD=Was.the.patient.diagnosed.with.non.CNS.extramedullary.disease.,
+         CNS=CNS.disease.at.on.study,
+         Risk.group,Primary.Cytogenetic.Code,
+         NPM.mutation, CEBPA.mutation,FLT3.ITD.positive.,
+         FAB_or_WHO.Classification, RAM.phenotype,
+         matches("^t.|^inv|^del|^MLL$|^mono|^Minus"), M6_AML, M7_AML,
+         matches("DEK|KDM5A|NSD1|RBM15"), 
+         matches("MRD\\.|CR.status"), 
+         CBFGLIS.like,
+         OS.time..days.=Overall.Survival.Time.in.Days,
+         EFS.time..days.=Event.Free.Survival.Time.in.Days,
+         OS.ID,
+         Event.ID) 
+  
+table(glis.like$CBFGLIS.like, useNA = "always")
+dim(glis.like)
+```
+
+
+```{r fig.width=10, fig.height=6}
+KM.glis.like <- KM.plots(df=filter(glis.like,
+                                   CBFGLIS.like != "CBFA2T3-GLIS2") %>%  #NUP98.KDM5A != "Yes"
+                           
+                           droplevels(), #CBFGLIS.like != "CBFA2T3-GLIS2" 
+                         group_vars=NULL, type="OS",
+                         covariate="CBFGLIS.like", 
+                         cohort="1031")
+
+grid.arrange(grobs=c(KM.glis.like$OS, KM.glis.like$EFS), ncol=2)
+```
+
+```{r}
+KM.glis.like$OS.diff
+summary(KM.glis.like$OS.cox[[1]])
+summary(KM.glis.like$OS.fit[[1]], times=c(0,3,5))
+```
+
+
+```{r warning=FALSE}
+c <- compareGroups(CBFGLIS.like ~ ., 
+                           method=4, 
+                           Q1=0, Q3=1, 
+                           ref.no="No",
+                           data = glis.like[,-c(1:4,57:61)])
+```
+
+```{r}
+tab <- createTable(c)
+
+tab
+# export2csv(tab,"TARGET_AML__1031_CBFGLIS-like_ClinChars_Table_1.18.19.csv")q
+```
+
+```{r}
+glis.like.df <-  glis.like %>% 
+  filter(CBFGLIS.like != "CBFA2T3-GLIS2") %>% 
+  mutate(CBFGLIS.like=ifelse(CBFGLIS.like == "OtherAML", "No", "Yes")) %>% 
+  set_rownames(.$USI)
+
+
+DEGs.glis.like <- twoGroups_DEGs(expnData = cts.list$cts.hd.1031, 
+                                 clinData = glis.like.df,
+                                 col = "CBFGLIS.like",
+                                 ref = "No", 
+                                 anno = FALSE,
+                                 SkipPlots = TRUE)
+
+table(DEGs.glis.like$phenovector)
+```
+
+```{r}
+DEGs.like.df <- extract_DEGs(DEGs.glis.like)
+
+
+head(DEGs.like.df)
+# dim(DEGs.like.df)#3565    8
+```
+
+```{r}
+common <- DEGs.like.df %>% 
+  filter(logFC > 1) %>% 
+  mutate(Common.All.Cell.Surface=ifelse(gene %in% All.Cell.Surface$gene, TRUE, FALSE),
+         Common.Highest.Cell.Surface=ifelse(gene %in% UpReg.CellSurface$gene, TRUE, FALSE)) %>%
+  filter(Common.Highest.Cell.Surface) %>%
+  full_join(., UpReg.CellSurface, by="gene", suffix = c("_in_CBFGLIS.like", "_in_CBFA2T3.GLIS2")) %>% 
+  select(gene,matches("logFC|adj|Compartment_membrane")) %>%
+  mutate_at(vars(matches("adj")), funs(ifelse(. < 0.001, "< 0.001", as.character(round(., digits = 4))))) %>%
+  arrange(desc(logFC_in_CBFA2T3.GLIS2))
+
+
+options(scipen=999)
+dim(common)
+
+# write.csv(common, "TARGET_AML_1031_CBFGLIS.like_DEGs_CellSurface_Common.csv", row.names = FALSE)
+# sum(common$Common.All.Cell.Surface)#451/789 - so there are 57% in common 
+# sum(common$Common.Highest.Cell.Surface) #57/79 - so 72% in common 
+```
+
+
+
+
+#Examine CD56 Expression
+
+
+```{r}
+anno %>%  
+  mutate_at(vars(Groups), 
+            funs(paste0("Group", .))) %>% 
+  group_by(Groups,Rare.Variants) %>%
+  summarize(Number=n()) %>%
+  spread(Groups,Number) %>%
+  mutate_at(vars(c("Group1","Group2")), 
+            funs(ifelse(is.na(.), 0, .))) %>%
+  group_by(Rare.Variants) %>%
+  mutate(percent=round(Group1/sum(Group1,Group2) * 100, digits = 2))
+
+```
+
+```{r}
+data.frame(NCAM1.CPM=DEGs$cts.hd.1031$DE$Voom$E["NCAM1",])
+```
+
+
+```{r warning=FALSE}
+t <- anno %>%
+  inner_join(.,
+             rownames_to_column(data.frame(NCAM1.CPM=DEGs$cts.hd.1031$DE$Voom$E["NCAM1",]),"USI"), 
+             by="USI") %>%
+  mutate(Groups=paste0("Group", Groups))
+
+t
+```
+
+```{r fig.height=5, fig.width=10}
+
+ggplot(t, aes(x=Groups, y=NCAM1.CPM, fill=Groups, color=Rare.Variants)) + 
+  geom_violin(draw_quantiles = TRUE, size=3)
+  # scale_color_manual(size=3)
+  
+```
+
+
+
+
+##Examine CD56 and MFI expression 
+
+```{r}
+MFI <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/FlowCytometry/MFI/2017July_Hematologics_MeanFluorescenceIntensity/TARGET_AML_0531_27June2017_2017.7.18FD_FLOWcytometetryData_FIXED_CBFGLIS_FalsePositives.csv", stringsAsFactors = FALSE)
+
+
+MFI <- MFI %>% 
+  filter(!is.na(CD45))
+
+dim(MFI) #437  20
+head(MFI)
+```
+
+```{r}
+library(ggpubr)
+```
+
+
+```{r}
+pos.0531 <- merged %>%
+  filter(Protocol != "AAML1031") %>%
+  filter(CBFA2T3.GLIS2 == "Yes") 
+
+pos.0531
+```
+
+
+```{r}
+CD56.MFI <- MFI %>%
+  dplyr::select(TARGET.USI, CD56) %>%
+  left_join(., dplyr::select(merged,TARGET.USI=USI, M7_AML, CBFA2T3.GLIS2), by="TARGET.USI") %>%
+  mutate(CBFA2T3.GLIS2=factor(CBFA2T3.GLIS2, levels=c("Yes", "No"))) %>%
+  set_rownames(.$TARGET.USI)
+
+head(CD56.MFI)
+# table(CD56.MFI$CBFA2T3.GLIS2, useNA = "always")
+# table(CD56.MFI$M7_AML, useNA = "always")
+```
+
+
+```{r message=FALSE}
+compare_means(CD56 ~ CBFA2T3.GLIS2, data=CD56.MFI, ref.group = "No")
+
+CD56.MFI %>% 
+  group_by(CBFA2T3.GLIS2) %>%
+  summarise(n=n(), median=round(median(CD56), digits = 3), 
+            range=paste(round(range(CD56), digits = 5), collapse = "-")) 
+
+```
+
+```{r fig.height=6, fig.width=5}
+cd56.0531.mfi <- ggviolin(mutate_if(CD56.MFI,is.numeric, function(x) log2(x+1)),
+               x="CBFA2T3.GLIS2", y="CD56", fill="CBFA2T3.GLIS2", 
+               draw_quantiles = c(0.5), 
+               color="azure3", size=1.25) +
+    ylim(c(0,15.75)) +
+    stat_compare_means(label.y = c(14.5), 
+                       comparisons = list(c("Yes", "No")),
+                       aes(label = ..p.signif..), 
+                       size=1.15)  +
+    scale_fill_manual(values=c("Yes"="red",  "No"="navy"),
+                      labels=c("Yes"="CBFA2T3.GLIS2", "No"="OtherAML")) +
+    scale_x_discrete(labels=c("Yes"="CBFA2T3.GLIS2", "No"="OtherAML")) +
+    labs(y="Log2( CD56 MFI + 1)", x="",
+         title="NCAM1 Expression in AAML0531 \n by Flow Cytometry") +
+    theme_numX +
+    theme(legend.text = element_text(size=20),
+          legend.title = element_blank(),
+          # axis.text.x = element_blank(),
+          # axis.ticks.x = element_blank(),
+          text = element_text(size=20),
+          axis.text.y = element_text(size=26),
+          axis.text.x = element_text(size = 20))
+
+cd56.0531.mfi$layers[[2]]$aes_params$textsize <- 8
+
+# tiff("TARGET_AML_0531_NCAM1_MFI_violinPlots.tiff", height=6, width=5, units="in", res=600)
+cd56.0531.mfi
+# dev.off()
+```
+
+
+```{r fig.height=5, fig.width=10}
+library(ComplexHeatmap)
+
+mat <- MFI %>%
+  dplyr::select(-Reg., -CBFGLIS.Status, -Cohort, -CD34.CV, -FSC, -SSC) %>%
+  gather(var,val, -TARGET.USI) %>%
+  spread(TARGET.USI, val) %>%
+  mutate_if(is.numeric, funs(log2(.+1))) %>%
+  column_to_rownames("var") 
+
+mat <- t(scale(t(mat)))
+
+len <- 299
+# col <- colorRampPalette(c("deepskyblue4", "deepskyblue3", "deepskyblue2", "deepskyblue1","white","red1", "red2", "red3", "red4"))(n=len)
+col <- colorRampPalette(c("cyan1", "cyan2", "cyan3", "cyan4",
+                          "azure4",
+                          "magenta4", "magenta3", "magenta2", "magenta1"))(n=len)
+
+# v <- colorRampPalette(plasma(6))(n=len)
+ 
+ha <- HeatmapAnnotation(df= CD56.MFI[colnames(mat),3:4], 
+                        gap = unit(1,"mm"),
+                        col=list("CBFA2T3.GLIS2"=c("No"="navy", "Yes"="red"), 
+                                 "M7_AML"=c("Yes"="firebrick4", "No"="navy","Unknown"="navy")))
+goi.idx <- 1:nrow(mat) #grep("CD45|CD56|CD38|HLADR", rownames(mat))
+labels <- rownames(mat)[goi.idx] #needs to be numeric indexes for complexheatmap
+      
+labs <- rowAnnotation(link = row_anno_link(at=goi.idx, labels=labels),
+                            width= unit(1, "cm") + max_text_width(labels), 
+                      gp=gpar(fontsize=100, 
+                              fontface="bold", 
+                              col="red"))
+# 
+# idx <- which(!grepl("CD45|CD56|CD38|HLADR", rownames(mat)))
+# lab2 <- rownames(mat)[idx] #needs to be numeric indexes for complexheatmap
+#       
+# labs2 <- rowAnnotation(link = row_anno_link(at=idx, labels=lab2),
+#                             width= unit(1, "cm") + max_text_width(labels), gp=gpar(fontsize=1))      
+# colorRamp2(c(-4,0,4), c("cyan","white","magenta")
+hmap <- Heatmap(matrix = mat,
+                  col=col, #use for breaks.,
+                  heatmap_legend_param=list(color_bar="continuous",
+                                            legend_direction="vertical", 
+                                            legend_width=unit(3,"cm"),
+                                            title_position="topcenter",
+                                            title_gp=gpar(fontsize=13, fontface="bold")),
+                  row_title="Antigens",
+                  row_title_side="left",
+                  row_title_gp=gpar(fontsize=15, fontface="bold"),
+                  show_row_names=FALSE,
+                  row_names_gp=gpar(fontsize=3),
+                  
+                  column_title="",
+                  column_title_side="top",
+                  column_title_gp=gpar(fontsize=15, fontface="bold"),
+                  column_title_rot=0,
+                  show_column_names=FALSE,
+                  
+                  clustering_distance_columns="euclidean",
+                  clustering_method_columns="ward.D2",
+                  clustering_distance_rows="euclidean",
+                  clustering_method_rows="ward.D2",
+                  
+                  row_dend_width=unit(8,"mm"),
+                  column_dend_height=unit(25,"mm"),
+                  
+                  top_annotation=ha,
+                  top_annotation_height=unit(2,"cm"))
+
+# tiff("TARGET_AML_MFI_Heatmap.tiff", height=5, width=10, units="in", res=350)  
+# draw(hmap + labs, heatmap_legend_side="right", annotation_legend_side="right")  
+# dev.off()
+```
+
+
+
+##MDS on the MFI and Gene level expression of RAM 
+
+```{r}
+RAM.genes <- assay(DEGs$cts.hd.1031$PCA$vst)[c("NCAM1","PTPRC","CD38","HLA-DRA", "HLA-DRB1", "HLA-DRB5", "HLA-DRB6"),]
+
+dim(RAM.genes)
+head(RAM.genes[,1:5])
+# head(assay(DEGs$cts.hd.1031$PCA$vst)[,1:5])
+```
+
+```{r}
+RAM.MFI <- MFI[,c("TARGET.USI","CD56","CD45","CD38","HLADR")]
+rownames(RAM.MFI) <- RAM.MFI[,1]
+RAM.MFI <- log2(t(RAM.MFI[,-1])+1)
+
+head(RAM.MFI[,1:5])
+```
+
+```{r}
+RAM.MDS <- plotPCoA(expnData = RAM.genes, phenovector = DEGs$cts.hd.1031$phenovector, 
+                    title = "RAM Gene Expression", 
+                    colorCodes = c("GroupA"="red", "GroupB"="black"))
+
+```
+
+
+```{r fig.height=5, fig.width=7}
+RAM.MDS$plot
+```
+
+```{r}
+p <- MFI$CBFGLIS.Status
+names(p) <- MFI$TARGET.USI
+
+RAM.MFI.MDS <- plotPCoA(expnData = RAM.MFI, phenovector = p, title = "RAM MFI Expression", colorCodes = c("Yes"="red", "No"="navy"), size=5)
+```
+
+```{r fig.height=5, fig.width=8}
+# tiff("CBFGLIS_RAM_MFI_MDSplot.tiff", height = 5, width = 8, units = "in", res=600)
+RAM.MFI.MDS$plot +
+  theme(legend.position = c(0.9,0.85),
+        legend.text = element_text(size=18)) +
+  stat_conf_ellipse()
+
+# dev.off()
+```
+
+
+# GABRE Expression
+
+```{r}
+GABRE <- TPMs["GABRE",] %>% 
+  rownames_to_column("gene") %>% 
+  gather(USI,TPM,-gene) %>% 
+  left_join(., forAnno, by="USI") %>% 
+  mutate_all(~ifelse(is.na(.), "NBM", .)) %>% 
+   mutate(Group=ifelse(grepl("^BM|^RO", USI), "NBM", "AML"), 
+          CBFA2T3.GLIS2=case_when(
+            grepl("GLIS2",  Rare.Fusions)~ "Yes",
+            Group == "NBM" ~ "NBM",
+            TRUE ~ "No"), 
+          log2_TPM=log2(TPM+1))
+
+head(GABRE)
+```
+
+```{r}
+table(GABRE$Group)
+table(GABRE$M7_AML)
+table(GABRE$CBFA2T3.GLIS2)
+```
+
+```{r}
+GABRE %>%
+  group_by(Group,CBFA2T3.GLIS2,M7_AML) %>% 
+  summarise(N=n(),min=min(TPM),mean=mean(TPM), median=median(TPM), max=max(TPM),perc75=quantile(TPM)[4])
+```
+
+```{r fig.width=4, fig.height=6}
+G.bplot <-ggplot(GABRE, aes(x=CBFA2T3.GLIS2, y=log2_TPM, fill=CBFA2T3.GLIS2)) + 
+  geom_boxplot(color="grey40") +
+  labs(title = "GABRE Expression", x="", y="log2 Transcripts per Million (TPM)") +
+  # facet_wrap(~M7_AML) +
+  theme_classic() + 
+  theme(text = element_text(size=16)) + 
+  scale_fill_manual(values=c("NBM"="grey80", "Yes"="red", "No"="navy")) +
+  scale_x_discrete(labels=c("NBM"="Normal\nMarrow", "No"="Fusion\nNegative", "Yes"="Fusion\nPositive")) + 
+  scale_fill_manual(values=c("NBM"="grey80", "Yes"="red", "No"="navy")) +
+  theme(strip.text = element_text(face="bold", size=18, color="black"), 
+        text = element_text(size=16, color="black"), 
+        axis.text = element_text(size=20, color = "black"), 
+        legend.position = "none") 
+
+G.bplot
+# saveRDS(G.bplot,"GABRE_CBFGLIS_boxplot.RDS")
+# ggsave("GABRE_CBFGLIS_boxplot.png",G.bplot, device = "png", dpi=350, units = "in", height = 6,width = 4)
+```
+
+
+
+#PRAME Expression
+
+```{r}
+library(ggpubr)
+```
+
+```{r}
+PRAME <- TPMs["PRAME",] %>% 
+  rownames_to_column("gene") %>% 
+  gather(USI,TPM,-gene) %>% 
+  left_join(., forAnno, by="USI") %>% 
+  mutate_all(~ifelse(is.na(.), "NBM", .)) %>% 
+   mutate(Group=ifelse(grepl("^BM|^RO", USI), "NBM", "AML"), 
+          CBFA2T3.GLIS2=case_when(
+            grepl("GLIS2",  Rare.Fusions)~ "Yes",
+            Group == "NBM" ~ "NBM",
+            TRUE ~ "No"), 
+          log2_TPM=log2(TPM+1))
+
+head(PRAME)
+```
+
+```{r}
+table(PRAME$Group)
+table(PRAME$M7_AML)
+table(PRAME$CBFA2T3.GLIS2)
+```
+
+```{r}
+PRAME %>%
+  group_by(Group,CBFA2T3.GLIS2,M7_AML) %>% 
+  summarise(N=n(),min=min(TPM),mean=mean(TPM), median=median(TPM), max=max(TPM),perc75=quantile(TPM)[4])
+```
+
+```{r fig.height=5, fig.width=7}
+my_comparisons <- list( c("Yes", "No"), c("Yes", "NBM"))
+
+p <- ggboxplot(PRAME, x = "CBFA2T3.GLIS2", y = "log2_TPM",
+                color = "CBFA2T3.GLIS2", 
+               palette =c("black", "navy", "red"),
+                add = "jitter", 
+               shape = "CBFA2T3.GLIS2",title = "PRAME Expression") +
+  stat_compare_means(comparisons = my_comparisons, label = "p.signif") +
+  # stat_compare_means(label.y = 8) +
+  theme(text = element_text(size = 16))
+
+
+p
+# saveRDS(p, "TARGET_AML_CBFLGS_PRAME_Expression_boxplot.RDS")
+# ggsave("TARGET_AML_CBFLGS_PRAME_Expression_boxplot.png",p, device = "png", height = 5, width = 7, units = "in", dpi=200)
+```
+
+
+#FOLR1 Expression
+
+```{r}
+library(ggpubr)
+```
+
+```{r}
+FOLR1 <- TPMs["FOLR1",] %>% 
+  rownames_to_column("gene") %>% 
+  gather(USI,TPM,-gene) %>% 
+  left_join(., forAnno, by="USI") %>% 
+  mutate_all(~ifelse(is.na(.), "NBM", .)) %>% 
+   mutate(Group=ifelse(grepl("^BM|^RO", USI), "NBM", "AML"), 
+          CBFA2T3.GLIS2=case_when(
+            grepl("GLIS2",  Rare.Fusions)~ "Yes",
+            Group == "NBM" ~ "NBM",
+            TRUE ~ "No"), 
+          log2_TPM=log2(TPM+1))
+
+head(FOLR1)
+```
+
+```{r}
+table(FOLR1$Group)
+table(FOLR1$M7_AML)
+table(FOLR1$CBFA2T3.GLIS2)
+```
+
+```{r}
+FOLR1 %>%
+  group_by(Group,CBFA2T3.GLIS2,M7_AML) %>% 
+  summarise(N=n(),min=min(TPM),mean=mean(TPM), median=median(TPM), max=max(TPM),perc75=quantile(TPM)[4])
+```
+
+```{r fig.height=5, fig.width=7}
+my_comparisons <- list( c("Yes", "No"), c("Yes", "NBM"))
+
+p.folr1 <- ggboxplot(FOLR1, x = "CBFA2T3.GLIS2", y = "log2_TPM",
+                color = "CBFA2T3.GLIS2", 
+               palette =c("black", "navy", "red"),
+                add = "jitter", 
+               shape = "CBFA2T3.GLIS2",title = "FOLR1 Expression") +
+  stat_compare_means(comparisons = my_comparisons, label = "p.signif") +
+  labs(x="")+
+  # stat_compare_means(label.y = 8) +
+  theme(text = element_text(size = 16))
+
+
+p.folr1
+# saveRDS(p.folr1, "TARGET_AML_CBFLGS_FOLR1_Expression_boxplot.RDS")
+# ggsave("TARGET_AML_CBFLGS_FOLR1_Expression_boxplot.png",p.folr1, device = "png", height = 5, width = 7, units = "in", dpi=200)
+```
+
+
+#Theraputic Targets Expression
+
+
+```{r}
+ADCs <- read.csv("Full_ADC_Target_Database_08.28.2019.csv") %>% 
+  select(-matches("^X"))
+head(ADCs)
+```
+
+```{r}
+DEGs.anno.sub <- read.csv("DEGs/TARGET_AML_1031_CBFGLIS_vs_OtherAML_DEGs_updateAnno.csv")
+head(DEGs.anno.sub)
+```
+
+```{r}
+DEGs.anno.NBM <- DEGs.NBM.Anno.Sub$cts.hd.1031
+head(DEGs.anno.NBM)
+```
+
+```{r}
+targets <- DEGs.anno.sub %>% 
+  select(-c(AveExpr:P.Value), -B,-FoldChange) %>%
+  filter(logFC > 1) %>%
+  rename_at(vars(logFC:adj.P.Val), ~paste0(., "_vsAML")) %>%
+  left_join(., select(DEGs.anno.NBM, gene,logFC,adj.P.Val) %>% 
+              filter(logFC > 1) %>%
+              rename_all(., ~paste0(., "_vsNBM")) ,
+            by=c("gene"="gene_vsNBM")) %>% 
+  select(-Predicted_Transmembrane_Structure,-contains("Cellular.Compartment"), everything(),Predicted_Transmembrane_Structure,contains("Cellular.Compartment")) %>% 
+  left_join(.,ADCs, by=c("gene"="Gene.symbol.of.ADC.target..Cleaned."))
+
+
+head(targets)
+dim(targets) #2,289   17
+```
+
+```{r}
+table(!is.na(targets$Antibody.Drug.Conjugate..ADC..symbol.or.trade.name))
+```
+
+```{r}
+ADC.targets <- targets %>% 
+  filter(gene %in% ADCs$Gene.symbol.of.ADC.target..Cleaned.)
+
+dim(ADC.targets)
+# write.csv(ADC.targets, "TARGET_AML_CBFGLIS_UpRegulated_ADC_Targets.csv", row.names = FALSE)
+```
+
+```{r}
+ADC.expn <- TPMs %>% 
+  as.data.frame() %>%
+  rownames_to_column("gene") %>% 
+  filter(gene %in% ADC.targets$gene) %>% 
+  gather(USI,TPM,-gene) %>%
+  mutate(Group=case_when(
+    USI %in% filter(merged, CBFA2T3.GLIS2 == "Yes")$USI ~ "Positive", 
+    grepl("^BM|^RO", USI) ~ "NBM",
+    TRUE ~ "Negative"), 
+    log2_TPM=log2(TPM+1)) %>% #log2_TPM=log2(TPM+1)
+  arrange(gene,Group,desc(TPM)) %>%
+  mutate(Order=row_number()) %>%
+  ungroup()
+
+
+dim(ADC.expn)
+# length(unique(ADC.expn$gene)) #2,830 genes
+head(ADC.expn[,])
+```
+
+```{r fig.width=12}
+ADC.boxplots <- ggplot(ADC.expn, aes(x=Group,y=log2_TPM, fill=Group)) + #color=Group
+  geom_jitter(aes(color=Group)) +
+  geom_boxplot(alpha=0.3, outlier.shape = NA) +
+  # geom_bar(stat="identity", show.legend = TRUE) +
+  facet_wrap(~gene, scales="free") +
+  labs(x="Patient") +
+  theme_classic() +
+  theme(axis.text.x = element_blank()) +
+  scale_fill_manual(values = c("Positive"="firebrick","Negative"="navy", "NBM"="black")) +
+  scale_color_manual(values = c("Positive"="firebrick","Negative"="dodgerblue1", "NBM"="grey40"))
+
+
+# ggsave("TARGET_AML_CBFLGIS_ADC_Targets_boxplots.pdf",ADC.boxplots,device = "pdf", height = 10, width = 12,units = "in")
+```
+
+```{r fig.width=16}
+ADC.waterfall <- ggplot(ADC.expn, aes(x=Order,y=TPM, fill=Group,color=Group)) + 
+  geom_bar(stat="identity", show.legend = TRUE) +
+  facet_wrap(~gene, scales="free") +
+  labs(x="Patient") +
+  theme_classic() +
+  theme(axis.text.x = element_blank()) +
+  scale_fill_manual(values = c("Positive"="firebrick","Negative"="dodgerblue1", "NBM"="black")) +
+  scale_color_manual(values = c("Positive"="firebrick","Negative"="dodgerblue1", "NBM"="grey40"))
+
+
+ADC.waterfall
+ggsave("TARGET_AML_CBFLGIS_ADC_Targets_Waterfalls.pdf",ADC.waterfall,device = "pdf", height = 10, width = 16,units = "in")
+```
+
+
+
+
+
+
+#Session Info
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+

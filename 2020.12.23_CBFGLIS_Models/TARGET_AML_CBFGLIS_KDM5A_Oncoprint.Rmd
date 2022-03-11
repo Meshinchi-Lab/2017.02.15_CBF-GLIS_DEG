@@ -1,0 +1,485 @@
+---
+title: "Oncoprint for CBFGLIS and NUP98-KDM5A Models"
+author: "Jenny Smith"
+date: "1/28/21"
+output: html_document
+---
+
+# Set-up 
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2017.02.15_CBF-GLIS_DEG/2020.12.23_CBFGLIS_Models/"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+node=Sys.info()[["nodename"]]
+if(!grepl("local", node)){
+  print(node)
+  options(bitmapType = 'cairo')
+  grDevices::X11.options(type='cairo')
+}
+
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+
+library(ggplot2)
+library(gridExtra)
+library(RColorBrewer)
+library(patchwork)
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+
+library(DeGSEA)
+
+getwd()
+```
+
+#ClinData
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_12.09.20.csv"))
+
+ineligables <- merged %>% 
+  filter(Eligibility_Comments=="remove") %>% 
+  pull(USI)
+
+
+merged <- merged %>% 
+  mutate(Age.in.years=as.numeric(Age.in.years)) %>% 
+  mutate_at(vars(Age.in.years, Age.in.days, 
+                 FLT3.ITD.allelic.ratio, 
+                 WBC..x10.3.MicroLiter..levels:IndII.Blast..BM,
+                 MRD...at.end.of.course.1:MRD...at.end.of.course.2,
+                 OS.time..days., EFS.time..days.,
+                 OS.ID:Event.ID,
+                 matches("Days.to.OS.|Days.to.DFS.|Days.to.RR.")), 
+            ~as.numeric(.)) %>% 
+  filter(!is.na(USI), USI != "Unknown") %>% 
+  filter(Eligibility_Comments !="remove")
+
+
+dim(merged)
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET, "SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_10.08.20.csv")) %>% 
+  filter(ifelse(Group=="AML" & USI %in% ineligables, FALSE, TRUE))
+
+
+dim(sample_info) # 2646 (2632 after removing ineligable samples)   15
+```
+
+
+# Age Barplot
+
+Age Cats
+0 - 1
+1 - 2
+2 - 5 
+5 - 10
+10 - 15 
+15 - 21
+21>
+
+```{r}
+CBFGLIS.KDM5A <- merged %>%  
+  filter(!is.na(Age.in.years)) %>% 
+  mutate(Fus.Group=factor(case_when(
+    grepl("GLIS2|KDM5A", Primary.Fusion)  ~ Primary.Fusion,
+    TRUE ~ "OtherAML"), 
+    levels=c("CBFA2T3-GLIS2", "NUP98-KDM5A", "OtherAML"))) %>% 
+  mutate(Age.Cat2=factor(case_when(
+    Age.in.years < 1.0 ~ "0 to <1",
+    Age.in.years >= 1.0 & Age.in.years < 2 ~ "1 to <2",
+    Age.in.years >= 2.0 & Age.in.years < 5 ~ "2 to <5",
+    Age.in.years >= 5.0 & Age.in.years < 10 ~ "5 to <10",
+    Age.in.years >= 10.0 & Age.in.years < 15 ~ "10 to <15",
+    Age.in.years >= 15.0 & Age.in.years < 21 ~ "15 to <21",
+    Age.in.years >= 21.0 ~ ">21"), 
+    levels=c("0 to <1", "1 to <2", "2 to <5",
+             "5 to <10","10 to <15","15 to <21", ">21")))
+  
+
+
+
+# table(CBFGLIS.KDM5A$Age.Cat2)
+levels(CBFGLIS.KDM5A$Age.Cat2)
+levels(CBFGLIS.KDM5A$Fus.Group)
+```
+  
+  
+```{r}
+age.df <- CBFGLIS.KDM5A %>%
+  # filter(Protocol=="AAML1031") %>% 
+  select(USI, Age.Cat2,Fus.Group, Primary.Fusion) %>% 
+  group_by(Age.Cat2,Fus.Group,.drop=FALSE) %>%
+  summarize(N=n()) %>% 
+  ungroup() %>% 
+  
+  group_by(Age.Cat2, .drop=FALSE) %>%
+  mutate(Percent=round(N/sum(N) * 100, digits=1)) %>%
+  ungroup() %>% 
+  
+  filter(grepl("GLIS2|KDM5A", Fus.Group)) %>% 
+  mutate(y.lab.pos=ifelse(Percent>0, Percent+0.5, Percent+0.25),
+         x.lab.pos=rep(1:7, each=2)) %>% 
+  
+  group_by(Age.Cat2, Fus.Group, .drop=FALSE) %>% 
+  mutate_at(vars(x.lab.pos), ~case_when(
+    Fus.Group == "CBFA2T3-GLIS2" ~ sum(., - 0.25),
+    TRUE ~ sum(.,0.3)
+  )) %>% 
+  ungroup() %>% 
+  mutate(x.lab.pos=ifelse(Age.Cat2==">21",7,x.lab.pos))
+  
+
+
+dim(age.df)
+# table(age.df$Age.Cat2)
+# length(unique(age.df$Age.Cat2))
+```
+
+```{r}
+age.bar <- ggplot(age.df, aes(x=Age.Cat2, y=Percent, fill=Fus.Group)) +
+  geom_col(position = position_dodge()) +
+  scale_fill_manual(values=c("CBFA2T3-GLIS2"="firebrick4", "NUP98-KDM5A"="mediumorchid")) +
+  labs(y="Prevalence (%)", title="Pediatric AML Fusion Prevalence by Age") +
+  theme_classic() +
+  geom_text(aes(label=paste0(Percent,"%"), y=y.lab.pos, x=x.lab.pos)) +
+  scale_y_continuous(limits = c(0,12), breaks = seq(0,12, by=2)) +
+  # annotate(geom="text", x=1:14, y=age.df$lab.pos, label=paste0(age.df$Percent,"%")) %>% 
+  theme(axis.text = element_text(size=14,color="black"),
+        axis.text.x = element_text(angle=15, vjust=1, hjust=1),
+        axis.title.y = element_text(size=18,color="black", face="bold"),
+        legend.position = c(0.75, 1.0),
+        axis.title.x = element_blank(),
+        legend.title = element_blank())
+
+age.bar
+# ggsave(plot=age.bar,filename = "TARGET_AML_CBFGLIS_NUP98.KDM5A_Prevalence_by_Age_Barplot.pdf", height = 5, width = 7)
+```
+
+# Kaplan-Meier
+
+```{r}
+library(patchwork)
+```
+
+```{r}
+in_df <- CBFGLIS.KDM5A %>% 
+  filter(!is.na(EFS.time..days.))
+
+cc <- c("CBFA2T3-GLIS2"="firebrick4", "NUP98-KDM5A"="mediumorchid", "OtherAML"="navy")
+
+KM <- KM.plots(df=in_df, 
+               group_vars = NULL,
+               type="OS",
+               covariate="Fus.Group",
+               cohort="1031", 
+               cc=cc,
+               riskTable = TRUE)
+```
+
+```{r fig.width=14, fig.height=7}
+# pdf("TARGET_AML_CBFGLIS_NUP98.KDM5A_KMplot.pdf", height = 7, width = 15)
+grid.arrange(grobs=c(KM$OS, KM$EFS), ncol=2)
+# dev.off()
+```
+
+# Format the Data
+
+```{r}
+binarize <-  function(mat, CDEs, Colnames){
+  for(i in 1:nrow(mat)){
+    gene <- rownames(mat)[i]
+    col <- Colnames[i]
+    binarized <- sapply(CDEs[[col]], function(g)  ifelse(g=="Yes",1,0))
+    mat[gene,] <- binarized
+  }
+  return(mat)
+}
+```
+
+```{r}
+dat <- CBFGLIS.KDM5A %>% 
+  filter(!grepl("OtherAML", Fus.Group)) %>% 
+  select(Reg.,Fus.Group, Age.in.years, M7_AML, M6_AML, 
+         FLT3.ITD.positive.,WT1.mutation.:CEBPA.mutation.,
+         c.Kit.Mutation.Exon.8,c.Kit.Mutation.Exon.17,
+         CBL.Mutation, Primary.Fusion, Primary.CNV, ISCN) %>% 
+
+  #Define updated columns 
+  mutate(
+         #Fusions
+         KMT2Ar=ifelse(grepl("KMT2A",Primary.Fusion), "Yes","No"),
+         RUNX1.RUNX1T1=ifelse(grepl("RUNX1-RUNX1T1",Primary.Fusion), "Yes","No"),
+         CBFB.MYH11=ifelse(grepl("CBFB-MYH11",Primary.Fusion), "Yes","No"),
+         NUP98r=ifelse(grepl("NUP98",Primary.Fusion), "Yes","No"),
+         CBFA2T3.GLIS2=ifelse(grepl("CBFA2T3-GLIS2",Primary.Fusion), "Yes","No"),
+         RBM15.MKL1=ifelse(grepl("RBM15-MKL1",Primary.Fusion), "Yes","No"),
+         HOXr=ifelse(grepl("HOX",Primary.Fusion), "Yes","No")) %>% 
+  #CNVs 
+  mutate(Monosomy7=ifelse(grepl("monosomy7",Primary.CNV), "Yes","No"),
+         Del5q=ifelse(grepl("del5q",Primary.CNV), "Yes","No"),
+         Trisomy8=ifelse(grepl("trisomy8",Primary.CNV), "Yes","No"),
+         Trisomy21=ifelse(grepl("trisomy21",Primary.CNV), "Yes","No"), 
+         Trisomy3=ifelse(grepl("\\+3", ISCN), "Yes", "No")) %>% 
+
+
+  #Clean up the mutation columns   
+  mutate(c.Kit.Mutation=case_when(
+    grepl("Yes", c.Kit.Mutation.Exon.8) | grepl("Yes", c.Kit.Mutation.Exon.17) ~ "Yes",
+    grepl("Unknown", c.Kit.Mutation.Exon.8) |  grepl("Unknown", c.Kit.Mutation.Exon.17) ~ "Unknown",
+    TRUE ~ "No"),
+    Age.Category=factor(case_when(
+      Age.in.years < 3 ~ "Less than 3 years",
+      Age.in.years >= 3 & Age.in.years < 15 ~ "Between 3 and 15 years",
+      Age.in.years >= 15 ~ "Greater than 15 years",
+       TRUE ~ "Unknown"), levels=c("Less than 3 years",
+                                   "Between 3 and 15 years",
+                                   "Greater than 15 years","Unknown"))) %>% 
+  mutate_at(vars(FLT3.ITD.positive.), ~case_when(
+    grepl("<0.1", .) ~ "No",
+    TRUE ~ .)) %>% 
+  mutate_at(vars(CBL.Mutation), ~case_when(
+    .=="No" ~ .,
+    grepl("Del_", .) ~ "Yes"))  %>%
+  mutate_at(vars(FLT3.ITD.positive.:CBL.Mutation),
+            ~ifelse(is.na(.), "Unknown", .))  %>% 
+  mutate(`Patient Subtype`="") %>% #dummy column for later
+  select(Reg.,Fus.Group,
+         `Patient Subtype`,
+         M7_AML, M6_AML,
+         `Age Category`=Age.Category,
+         FLT3.ITD.positive.:CBL.Mutation,c.Kit.Mutation,
+         Monosomy7:Trisomy3,
+         KMT2Ar:HOXr, 
+         ISCN,
+         -Primary.Fusion, -Primary.CNV, -Age.in.years,
+         -c(c.Kit.Mutation.Exon.8:c.Kit.Mutation.Exon.17))
+
+# head(dat, n=20)
+# table(dat$Trisomy3, dat$Fus.Group)
+# dat$`Patient Subtype`
+```
+
+```{r}
+dat <- dat %>%
+  mutate_at(vars(FLT3.ITD.positive.:HOXr),~gsub("Unknown", "No", .)) %>% 
+  #Create an order
+  arrange(Fus.Group,
+          desc(Trisomy21),
+          desc(Trisomy3),
+          desc(Trisomy8),
+          desc(WT1.mutation.),
+          desc(FLT3.ITD.positive.),
+          desc(c.Kit.Mutation),
+          desc(CBL.Mutation)) %>% 
+          # desc(KMT2A),
+          # desc(CEBPA.mutation.),
+          # desc(t.8.21.),
+          # desc(inv.16.),
+          # desc(NPM.mutation.),
+          # desc(c.Kit.Mutation),
+          # desc(CBL.Mutation)) %>%
+  as.data.frame()
+
+
+genes <- c("Patient Subtype", 
+           "Monosomy7", "Del5q", "Trisomy8", "Trisomy21","Trisomy3",
+           "FLT3-ITD","WT1","NPM1","CEBPA", "cKIT", "CBL", 
+           "KMT2Ar","HOXr", "RUNX1-RUNX1T1","CBFB-MYH11","RBM15-MKL1") 
+
+
+names(genes) <- c("Patient Subtype",
+                  "Monosomy7", "Del5q", "Trisomy8", "Trisomy21","Trisomy3",
+                   "FLT3.ITD.positive.", "WT1.mutation.", "NPM.mutation.", "CEBPA.mutation.", "c.Kit.Mutation","CBL.Mutation",
+                  "KMT2Ar","HOXr","RUNX1.RUNX1T1", "CBFB.MYH11","RBM15.MKL1") #"RAS.Mutation",
+
+# genes
+# length(genes) #17 rows
+# sapply(dat[,names(genes)], table, useNA='ifany')
+dimnames=list(genes,dat$Reg.)
+
+
+alter_list <- list(`CBFA2T3-GLIS2`=matrix(0, ncol=nrow(dat),nrow=length(genes), 
+                                   dimnames = dimnames),
+                   `NUP98-KDM5A`=matrix(0, ncol=nrow(dat),nrow=length(genes), 
+                                   dimnames = dimnames),
+                   fusion=matrix(ncol=nrow(dat),nrow=length(genes), 
+                                   dimnames = dimnames),
+                   mutation=matrix(ncol=nrow(dat),nrow=length(genes), 
+                                   dimnames = dimnames),
+                   cnv=matrix(ncol=nrow(dat),nrow=length(genes),
+                                        dimnames=dimnames))
+alter_list <- alter_list[c("CBFA2T3-GLIS2","NUP98-KDM5A", "cnv","mutation","fusion")]
+
+# lapply(alter_list, function(x) head(x[,1:5], n=17))
+# lapply(alter_list, dim)
+```
+
+```{r}
+types <- list("Fusions"=c("KMT2Ar","HOXr", "RUNX1-RUNX1T1","CBFB-MYH11","RBM15-MKL1"),
+              "Mutations"=c("FLT3-ITD","WT1","NPM1","CEBPA", "cKIT", "CBL"),
+              "CNVs"=c("Monosomy7", "Del5q", "Trisomy8", "Trisomy21","Trisomy3"))
+types <- types[c("CNVs","Mutations","Fusions")]
+
+alter_list$`CBFA2T3-GLIS2`["Patient Subtype",] <- ifelse(dat[["Fus.Group"]] == "CBFA2T3-GLIS2", 1,0)
+alter_list$`NUP98-KDM5A`["Patient Subtype",] <- ifelse(dat[["Fus.Group"]] == "NUP98-KDM5A", 1,0)
+
+alter_list$fusion <- binarize(mat = alter_list$fusion, CDEs=dat, Colnames=names(genes))
+alter_list$fusion[c(types$Mutations, types$CNVs),] <- 0
+
+alter_list$mutation <- binarize(mat = alter_list$mutation, CDEs=dat, Colnames=names(genes))
+alter_list$mutation[c(types$Fusions, types$CNVs),] <- 0
+
+alter_list$cnv <- binarize(mat = alter_list$cnv, CDEs=dat, Colnames=names(genes))
+alter_list$cnv[c(types$Mutations, types$Fusions),] <- 0
+
+
+# lapply(alter_list, head)
+# apply(alter_list$mutation,1,table, useNA='ifany') %>% as.data.frame()
+# apply(alter_list$fusion,1,table, useNA='ifany') %>% as.data.frame()
+# apply(alter_list$cnv,1,table, useNA='ifany') %>% as.data.frame()
+```
+
+
+# Oncoprint
+
+```{r}
+suppressPackageStartupMessages(library(ComplexHeatmap))
+```
+
+```{r}
+colorBars <-list("M7_AML"=c("Yes"="slateblue4", "No"="slateblue1", "Unknown"="grey80"),
+                 "M6_AML"=c("Yes"="skyblue3", "No"="skyblue", "Unknown"="grey80"))
+                 # "Age Category"=c("Less than 3 years"=brewer.pal(4,"Reds")[1],
+                 #            "Between 3 and 15 years"=brewer.pal(4,"Reds")[2],
+                 #             "Greater than 15 years"=brewer.pal(4,"Reds")[3],
+                 #             "Unknown"="grey80"))
+
+
+bar_param <- default_axis_param("column") 
+bar_param$gp$fontsize <- 16
+
+row_bar_param <- default_axis_param("row")
+row_bar_param$gp$fontsize <- 18
+
+HA_samples <- HeatmapAnnotation(
+  which = "column",
+  cbar = anno_oncoprint_barplot(axis_param=bar_param),
+  df=as.data.frame(select(dat,M7_AML, M6_AML)),
+  name="CBFA2T3-GLIS2 and NUP98-KDM5A Oncoprint",
+  col=colorBars,
+  gap=unit(2.5,"mm"),
+  simple_anno_size = unit(1.0, "cm"),
+  annotation_name_gp = gpar(fontsize=20),
+  annotation_legend_param=list(title_gp=gpar(fontsize = 18),
+                               labels_gp=gpar(fontsize=12)))
+
+# HA_samples
+```
+
+```{r}
+col = c(`CBFA2T3-GLIS2`="firebrick4",
+        `NUP98-KDM5A`="mediumorchid",
+        mutation = "dodgerblue4",
+        fusion="dodgerblue3",
+        cnv="dodgerblue1")
+col
+
+# barplot(rep(1,3), col=RColorBrewer::brewer.pal(3,"Blues")
+# brewer.pal(3,"Blues")
+```
+
+```{r}
+dummy_cats <- unlist(sapply(1:3, function(i) rep(paste0(rep(" ", i), collapse=""),length(types[[i]]))))
+splits.df <- data.frame(Gene=genes) %>% 
+  mutate(Type=c("", dummy_cats)) %>% 
+  select(Type)
+
+# splits.df
+```
+
+```{r fig.width=15, fig.height=6}
+linewidth=3
+op <- oncoPrint(mat=alter_list, 
+          alter_fun = list(
+            background = function(x, y, w, h) 
+              grid.rect(x, y, w, h,
+                        gp = gpar(fill = "grey90",
+                                  col="white",
+                                  lwd=linewidth)),
+             `CBFA2T3-GLIS2` = function(x, y, w, h) 
+                        grid.rect(x, y, w, h, 
+                          gp = gpar(fill = col["CBFA2T3-GLIS2"], 
+                                    col = "white",
+                                    lwd=linewidth)), 
+              `NUP98-KDM5A` = function(x, y, w, h) 
+                        grid.rect(x, y, w, h, 
+                          gp = gpar(fill = col["NUP98-KDM5A"], 
+                                    col = "white",
+                                    lwd=linewidth)),
+                 mutation = function(x, y, w, h) 
+                    grid.rect(x, y, w, h, 
+                      gp = gpar(fill = col["mutation"],
+                                col = "white",
+                                lwd=linewidth)),
+                 fusion = function(x, y, w, h) 
+                    grid.rect(x, y, w, h, 
+                      gp = gpar(fill = col["fusion"],
+                                col = "white",
+                                lwd=linewidth)), 
+                 cnv = function(x, y, w, h) 
+                    grid.rect(x, y, w, h, 
+                      gp = gpar(fill = col["cnv"], 
+                                col = "white",
+                                lwd=linewidth))), 
+    col = col,
+    top_annotation = HA_samples,
+    right_annotation = rowAnnotation(rbar = anno_oncoprint_barplot(axis_param = row_bar_param)),
+    column_order = 1:ncol(alter_list$fusion),
+    # row_order = 1:nrow(alter_list$fusion),
+    left_annotation = rowAnnotation(split = anno_block(
+        gp = gpar(fill = c("white","dodgerblue4","dodgerblue3","dodgerblue1"),
+                  col=NA),
+        labels = c("X","CNV","Mutations", "Fusions"),
+        labels_gp = gpar(col = "white", fontsize = 20, fontface="bold"))),
+
+    row_split = rev(splits.df),
+    gap=unit(0.5,"cm"),
+    row_names_gp=gpar(col="black",
+                      fontsize=20,
+                      fontface="bold"),
+    pct_gp = gpar(fontsize = 24))
+
+
+# pdf("TARGET_AML_CBFGLIS_NUP98-KDM5A_Oncoprint_01.29.21.pdf", height = 8, width = 20)
+op
+# dev.off()
+
+
+# saveRDS(list(op,HA_samples,linewidth,col),"TARGET_AML_CEBPA_Oncoprint.RDS")
+```
+
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+

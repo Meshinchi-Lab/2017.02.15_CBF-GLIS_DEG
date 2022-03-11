@@ -1,0 +1,746 @@
+---
+title: "CBF-GLIS AML "
+author: "Jenny Smith"
+date: "July 13, 2017"
+output: html_document
+---
+
+
+
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', message = FALSE)
+knitr::opts_knit$set(root.dir = '~/RNA_seq_Analysis/2017.02.15_CBF-GLIS_DEG/ASH/')
+```
+
+NOTE: Depending on which R module loaded, MUST specify the lib.loc and the path the scripts/
+R 
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(survival)
+library(dendextend)
+library(gage)
+library(gageData)
+library(genefilter)
+
+getwd()
+```
+
+
+```{r}
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/Heatmaps_Function.r")
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/clusterAnalysis_Function.r")
+source("~/scripts/conversion_scripts/GSEA_fmt_conversion_Function.r")
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/GAGE_GSEA_Function.r")
+source("~/scripts/survival_analysis/Survplot_Functions_2017.03.31.r")
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/Expression_Distribution_Plots_Function.r")
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/ggplot_Themes_Function.r")
+```
+
+
+#KEGG Gene Sets
+
+```{r}
+  #Load the kegg human datasets
+  data("kegg.gs")
+  data("go.sets.hs")
+  data("egSymb")
+
+  #create objects to hold the information from the datasets loaded above
+  kg.hsa=kegg.gsets("hsa")
+  #sig = signaling, met = metabolic pathways.
+  kegg.gs=kg.hsa$kg.sets[kg.hsa$sigmet.idx]
+  #convert to gene symbols
+  kegg.gs.sym <- lapply(kegg.gs, eg2sym)
+```
+
+
+#Read in the Annotation data 
+
+```{r}
+clinData <- read.csv("~/reference_mapping-files/TARGET_AML_current_asof_june30_2016_UPDATED_RhondaEdit_2017.06.08.csv", stringsAsFactors = FALSE, row.names = 1)
+
+
+clinData$Bone.marrow.leukemic.blast.percentage.... <- as.numeric(as.character(ifelse(clinData$Bone.marrow.leukemic.blast.percentage.... == ".", NA, clinData$Bone.marrow.leukemic.blast.percentage....)))
+
+
+head(clinData[,1:5])
+```
+
+
+#Read in the differentially Expressed Genes adn Expression Data
+
+Will use batch corrected counts to reconcile with the recent publication by Heather Shubeck under review. 
+Will focus primarily on the LD cohort. 
+
+```{r}
+LD_pheno <- get(load("../LD_CBFGLIS_status.RData"))
+```
+
+```{r}
+DEGs.OtherAML <- read.csv("DE_lowDepth_withGeneSymbol_2017.02.20.csv", stringsAsFactors = FALSE, row.names = 1)
+DEGs.BM <- read.csv("batchCorrected/TARGET_AML_CBFGLISvsNormalBM_DEGs_LimmaBatchCorrected.csv", stringsAsFactors = FALSE, row.names = 1)
+```
+
+
+
+#CTAs in CBF-GLIS AML 
+
+CTAs found significantly differntially expressed in all AML vs Normal BM, and found in CBF-GLIS AML vs Normal BM 
+
+```{r}
+CTAs <- c("PRAME", "CCNA1", "IGF2BP3", "TEX14", "SPAG6", "CT45A5", "LYK6", "CCDC62", "ZNF165", "KDM5B", "CALR3")
+```
+
+```{r}
+ #drop NAs that are introduced when subsetting CTAs 
+na.omit(DEGs.BM[CTAs,])
+```
+
+```{r}
+# write.csv(na.omit(DEGs.BM[CTAs,]), file="CBFGLIS_vs_OtherAML_CTAs_DE.csv")
+```
+
+
+#Fix Heatmap of DEGs
+
+```{r}
+CBFvsBM <- get(load("../CBFGLIS_vs_NormalBM/TARGET_AML_CBFGLISvsNormalBM_LimmaBatchCorrected.RData"))
+```
+
+
+```{r}
+btc <- get(load("../ExpressionData/RNAseq_Counts_HD_LD_batchCorrected.RData"))$batchCorrected
+dim(btc)
+```
+
+```{r}
+genes.BM <- rownames(DEGs.BM[order(-abs(DEGs.BM$logFC), DEGs.BM$adj.P.Val), ])[1:500]
+genes.otherAML <- rownames(DEGs.OtherAML[order(-abs(DEGs.OtherAML$logFC), DEGs.OtherAML$adj.P.Val), ])[1:500]
+```
+
+
+```{r}
+d.BM <- dendrograms(btc, CBFvsBM$phenovector,genes.BM, method="mcquitty")
+d.AML <- dendrograms(btc, LD_pheno, genes.otherAML, method="mcquitty")
+```
+
+
+```{r fig.width=10, fig.height=10}
+BM.Colors <- ifelse(CBFvsBM$phenovector == "GroupA", "red", "black")
+# pdf(file="CBFvsNormalBM_BatchCorretedReads_McQuittyLinkage_Heatmap.pdf", height = 7, width = 7)
+basicHeatmap(d.BM$expnData, d.BM$c2, d.BM$c1,colors = BM.Colors,main = "CBFvsNormalBM_btc")
+# dev.off()
+```
+
+```{r fig.width=10, fig.height=10}
+AML.Colors <- ifelse(LD_pheno == "pos", "red", "darkblue")
+# pdf(file="CBFGLIS_vs_OtherAML_500HighestDEGs_heatmap_02Sept2017.pdf")
+basicHeatmap(d.AML$expnData, d.AML$c2, d.AML$c1, colors = AML.Colors, main="CBFvsAML_btc")
+# dev.off()
+```
+
+
+#Read in the TPM values
+
+```{r}
+TPM <- get(load("../ExpressionData/TARGET_AML_TPM_withGenesasRowNames_BCCA28Apr2016.RData"))
+head(TPM)
+```
+
+```{r}
+dim(TPM) #51,573 genes
+```
+
+```{r}
+remLowCounts <- rowSums(TPM) > 1
+TPM <- TPM[remLowCounts,]
+dim(TPM) #43,442 genes
+```
+
+
+
+#Perform GSEA on CBFGLIS versus Normals
+
+```{r}
+pos <- names(grep("pos", LD_pheno, value = TRUE))
+Neg <- names(grep("pos", LD_pheno, value=TRUE, invert = TRUE))
+BM <- names(grep("GroupB", CBFvsBM$phenovector, value=TRUE))
+```
+
+```{r}
+# gct(df = btc, groupA = pos, groupB = BM, fileName = "TARGET_AML_CBFGLISvsNormalBM_batchCorrected.gct")
+```
+
+```{r}
+# cls(groupA = pos, groupB = BM, fileName = "TARGET_AML_CBFGLISvsNormalBM_batchCorrected.cls")
+```
+
+
+#Perform GSEA on CBFGLIS vs Other AML
+```{r}
+TPM.AML <- TPM[,c(pos,Neg)]
+dim(TPM.AML)
+```
+
+```{r}
+# gct(df=TPM.AML, groupA = pos, groupB = Neg, fileName = "TARGET_AML_CBFGLISvsOtherAML_TPM_filterLowCounts.gct")
+```
+
+```{r}
+# cls(groupA = pos, groupB = Neg, fileName = "TARGET_AML_CBFGLISvsOtherAML_TPM_filterLowCounts.cls")
+```
+
+
+#Blast Percentage
+
+```{r}
+cbf.bp <- subset(clinData, grepl("CBFA2T3-GLIS2",clinData$Reason))
+cbf.bp <- cbf.bp[order(-cbf.bp$Bone.marrow.leukemic.blast.percentage....), ]
+blastPerc <- ggplot(cbf.bp, aes(x=reorder(as.factor(cbf.bp$TARGET.USI.1), cbf.bp$Bone.marrow.leukemic.blast.percentage....), y=Bone.marrow.leukemic.blast.percentage....)) +
+  geom_bar(stat="identity", fill="red") + labs(x="Patient", y="Blast Percent", title="Blast Percentage in CBF-GLIS Positive Samples") + geom_hline(yintercept = 50)
+```
+
+```{r}
+library(pryr)
+reorder <- as.character(reorder(as.factor(cbf.bp$TARGET.USI.1), cbf.bp$Bone.marrow.leukemic.blast.percentage....))
+theme_JS %<a-% { theme(plot.title = element_text(hjust = 0.5, size = 18),
+                       panel.background = element_rect(fill="white"),
+                       panel.grid.major = element_blank(),
+                       panel.grid.minor = element_blank(),
+                       panel.border = element_rect(color = "black", fill=NA),
+                       axis.text = element_text(color = "black"),
+                       axis.text.x = element_text(angle = 45,hjust=1,vjust = 1, size = 10, 
+                                                  color=ifelse(reorder[c(19:1,20)] %in% pos, "purple", "black")),
+                       axis.text.y = element_text(size = 14),
+                       axis.title = element_text(size = 14))
+}
+```
+
+```{r}
+# pdf(file="BlastPercentages_CBFGLIS.pdf")
+blastPerc + theme_JS
+# dev.off()
+```
+
+
+#Downstream targets 
+
+```{r}
+# pdf(file="TARGET_AML_Distribution_BMP2-4_WNT1-3-11_ERG_PRAME.pdf")
+expn <- expnDist(expnMatrix = btc, phenoVector = CBFvsBM$phenovector, geneList = c("BMP2","BMP4","WNT11","WNT1","WNT3","ERG", "PRAME"), unit="Btc Corrected Reads", logCPM = FALSE, plot=TRUE)
+# dev.off()
+```
+
+
+WNTS in CBFGLIS vs Normals ... 
+
+GENE      FC
+WNT10A	-2.397274082
+WNT10B	-1.802785133
+WNT11	2.661002322   
+WNT5B	-2.128942203
+WNT7A	-2.595491178
+ERG	2.028109832
+
+WNT11A and ERG co-expression known(https://www.nature.com/onc/journal/v30/n17/full/onc2010582a.html) in 80% of AML. 
+
+Genes up-regulated in CBF-GLIS vs otherAML 
+
+GENE  FC
+WNT1	2.405969394
+WNT3	2.264833738
+WNT4	1.204485935
+
+Transfection of stromal cells with mouse Wnt1, Wnt5a or Wnt10b resulted in proliferation of AA4+cKIT+SCA1+ mouse fetal liver cells, a cell population highly enriched in HSC activity. Wnt3a activates beta-catenin by stabilizing it in the cytosol and induces known Wnt targets, such as Myc, cyclin D1 and MSX1.Notch1 is upregulated in response to Wnt signaling in HSCs, raising the possibility that Wnt exerts its influence also by activating Notch1 target genes (http://www.nature.com/leu/journal/v21/n8/full/2404732a.html)
+IDEA: Make gen-set with WNT1 and WNT3 target genes. (if possible)
+TEST: GSEA/GSA 
+
+
+
+#BMPs 
+
+BMPs in diff reg in CBF vs other AML 
+
+GENE   FC
+BMP1	2.122715406
+BMP2	2.829151498 ##Approximately 30 TPM expression
+BMP4	2.151701176
+BMP3	-2.928178364
+BMP6	-2.728238488
+BMP8B	-3.627953882
+BMPR1A	-2.950879757
+
+
+
+BMPs diff reg in CBF vs Normals
+
+GENE  FC
+BMP2	4.57248632
+BMP4	3.087587053
+BMP2K	2.94992713
+
+```{r}
+# up.dn <- read.csv("BMP2_DEGs_InCommonSAM13770genes_2015.csv", stringsAsFactors = FALSE)
+# head(up.dn)
+```
+
+
+```{r}
+# BMP2.Sig <- read.csv("BMP2_InducedSignature_2015.csv", stringsAsFactors = FALSE)
+# head(BMP2.Sig)
+```
+
+```{r}
+# BMP2.UP.Common<- unique(up.dn[grepl("UP", up.dn$Up_DN_Regulation), "Gene.symbol"])
+# BMP2.DN.Common <- unique(up.dn[grepl("DN", up.dn$Up_DN_Regulation), "Gene.symbol"])
+# BMP2.SigG <- unique(BMP2.Sig$GeneSymbol)
+
+# BMP2.gset <- list(BMP2.UP.Common=BMP2.UP.Common, 
+                 # BMP2.DN.Common=BMP2.DN.Common,
+                 # BMP2.Sig=BMP2.SigG)
+
+
+# head(BMP2.gset)
+```
+
+```{r}
+# BMP2.gmt <- data.frame(gset=c("BMP2.UP.Common","BMP2.DN.Common", "BMP2.Sig"),
+#                        source=rep("https://doi.org/10.1186/s12920-015-0090-4", 3),
+#                        genes=c(paste(BMP2.UP.Common, collapse = "\t"), 
+#                               paste(BMP2.DN.Common, collapse = "\t"),
+#                               paste(BMP2.SigG, collapse = "\t")))
+# 
+# 
+# apply(BMP2.gmt, 1, function(x) cat(x, file="Custom_setOf12_JS.gmt", append = TRUE,sep="\n"))
+```
+
+
+#Heatmaps 
+
+```{r}
+basicHeatmap.RowAnno <- function(ExpnMatrix, geneDend, sampleDend, colors, main){
+  require(gplots)
+  require(pryr)
+  library(colorspace)
+  #ExpnMatrix is the genes as rownames, patient IDs as colnames
+  #genedend is from hclust object
+  #sample dend is from hclust objest
+  #rowlabels is the rownames of the initial expn matrix
+  #colors is a character vector of colors of equal length of samples to illustrate the different groups as a list with first item == column colors, second item rowside colors
+  #main is character vector for the main title
+  
+  main="Unsupervised Clustering of \n AML Patient Samples"
+  colorPal <- colorRampPalette(c("deepskyblue4", "deepskyblue3", "deepskyblue2", "deepskyblue1","white","red1", "red2", "red3", "red4"))(n=299)
+  N <- ncol(ExpnMatrix)
+  rowLabels <- rownames(ExpnMatrix)
+  
+    z.pryr %<a-% {
+    par(cex.main=1.5, cex=0.75, font=2, font.axis=1, lend=1) 
+    heatmap.2(as.matrix(ExpnMatrix), 
+              Colv=rotate(as.dendrogram(sampleDend), 
+                          order = c(N:1)), 
+              Rowv=as.dendrogram(geneDend), 
+              labRow=rowLabels,
+              labCol = "",
+              ColSideColors = colors[[1]],
+              RowSideColors = colors[[2]],
+              density.info="density", #density.info="density",
+              trace = "none",
+              scale="row",
+              col = colorPal, 
+              cexRow=0.2,
+              margins=c(0,5), 
+              lwid=c(.5,3), 
+              lhei=c(0.5,3), 
+              srtCol=75, 
+              adjCol=c(1,1),
+              keysize=0.75, 
+              key.title="",
+              key.ylab ="",
+              key.par = list(cex=0.5),
+              main=main)
+  }
+  return(z.pryr)
+}
+```
+
+
+```{r}
+library(qusage)
+
+custom.GMT <- read.gmt(file = "GSEA/Custom_setOf12_JS.gmt")
+# head(custom.GMT)
+```
+
+```{r}
+dends <- lapply(custom.GMT, function(x) dendrograms(df=btc, pheno = CBFvsBM$phenovector, genelist = x, method = "mcquitty"))
+names(dends) <- names(custom.GMT)
+```
+
+```{r}
+dends.AML <- lapply(custom.GMT, function(x) dendrograms(df=btc, pheno = LD_pheno, genelist = x, method = "mcquitty"))
+names(dends.AML) <- names(custom.GMT)
+```
+
+
+#BMP2 Signature
+
+```{r fig.width=7, fig.height=8}
+# colors <- ifelse()
+basicHeatmap(dends$BMP2.UP.Common$expnData, dends$BMP2.UP.Common$c2, dends$BMP2.UP.Common$c1, BM.Colors,main = "BMP2 UP")
+```
+
+NOTE: Checked that gmt gene list and the table being read in are in the same order, so cell types
+not switched. 
+
+#Immune Signature
+
+```{r}
+imTblHB <- read.table("~/RNA_seq_Analysis/0000.00.01_GSEA_geneSets_gmt/custom/immuneMarkersTblHB.txt", stringsAsFactors = FALSE, header = TRUE)
+
+gs <- intersect(rownames(dends$immuneMarkersTblHB$expnData), imTblHB$gene)
+
+imTblHB <- imTblHB[match(gs, imTblHB$gene), ] 
+head(imTblHB)#360 but only 170 in the btc corrected expn matrix
+```
+
+23 unique cell types 
+
+```{r}
+nanoStrImm <- read.table("~/RNA_seq_Analysis/0000.00.01_GSEA_geneSets_gmt/custom/nanoStringImmuneCellMarkers.txt", stringsAsFactors = FALSE, header=TRUE)
+gs <- intersect(rownames(dends$nanoStringImmuneCellMarkers$expnData), nanoStrImm$gene)
+nanoStrImm <- nanoStrImm[match(gs, nanoStrImm$gene), ]
+
+head(nanoStrImm) #109 genes with 106 in batch corrected expn matrix
+```
+24 unique cell types
+
+
+```{r fig.width=10, fig.height=10}
+df.HB <- data.frame(Cell=as.character(imTblHB[,2]))
+df.HB$Cell <- as.character(df.HB$Cell)
+
+imTblColors <- list(column=BM.Colors,
+                    row=colorVectors_asList(df.HB)[[1]])
+# write.csv(df, "ImmuneTblHB_CellTypeToColors.csv")
+```
+
+```{r}
+df.NS <- data.frame(Cell=as.character(nanoStrImm$cellType))
+df.NS$Cell <- as.character(df.NS$Cell)
+
+nanoStrColors <- list(column=BM.Colors,
+                      row=colorVectors_asList(df.NS)[[1]])
+
+# write.csv(df, "NanostringImmuneMarkers_CellTypeToColors.csv")
+```
+
+```{r fig.width=10, fig.height=10}
+# pdf(file="ImmuneMarkersDNinCBF_withCellType.pdf")
+basicHeatmap.RowAnno(dends$immuneMarkersTblHB$expnData, dends$immuneMarkersTblHB$c2, dends$immuneMarkersTblHB$c1, imTblColors,main = "Immune Tbl HB Markers Negatively Enriched path")
+# dev.off()
+```
+
+```{r fig.width=10, fig.height=10}
+# pdf(file="NanostringImmuneMarkersDNinCBFGLIS_withCellType.pdf")
+basicHeatmap.RowAnno(dends$nanoStringImmuneCellMarkers$expnData, dends$nanoStringImmuneCellMarkers$c2, dends$nanoStringImmuneCellMarkers$c1, nanoStrColors,main = "Immune Markers Negatively Enriched path")
+# dev.off()
+```
+
+```{r fig.width=10, fig.height=10}
+basicHeatmap(dends.AML$PID_IL12_2PATHWAY$expnData, dends.AML$PID_IL12_2PATHWAY$c2, dends.AML$PID_IL12_2PATHWAY$c1, AML.Colors, main="IL12 Signaling Neg Enrich" )
+```
+
+
+#Heatmap without Ordering Genes
+
+```{r}
+nanostringCols <- read.csv("NanostringImmuneMarkers_CellTypeToColors.csv", stringsAsFactors = FALSE, row.names = 1)
+
+dim(nanostringCols)
+```
+
+```{r}
+expn_CellType <- transform(merge(dends$nanoStringImmuneCellMarkers$expnData, nanostringCols, by.x=0, by.y="gene"), row.names=Row.names, Row.names=NULL)
+expn_CellType <- expn_CellType[order(expn_CellType$Cell),]
+dim(expn_CellType)
+# write.csv(expn_CellType, file="NanostringImmuneMarkers_Log2BtcCorrectedreads_withAnnotation.csv")
+```
+
+```{r}
+annoRow <- data.frame(Cell=expn_CellType$Cell) %>% set_rownames(., rownames(expn_CellType))
+# annoRow
+annoCol <- data.frame(CBFvsBM$phenovector)
+# annoCol
+annoColors <- colorCodes_aheatmap(df.NS)
+# save(annoColors, file="NanostringImmuneMarkers_AnnoColors.RData")
+```
+
+
+```{r fig.width=10,fig.height=10}
+library(NMF)
+colorPal <- colorRampPalette(c("deepskyblue4", "deepskyblue3", "deepskyblue2", "deepskyblue1","white","red1", "red2", "red3", "red4"))(n=299)
+
+# pdf(file="NanostringImmuneMarkers_aheatmap_noOrderToRows.pdf")
+par(cex.main=1.5, cex=0.75, font=2, font.axis=1, lend=1) 
+aheatmap(expn_CellType[,1:27], 
+             annCol = annoCol,
+              annRow = annoRow,
+             annColors = annoColors,
+              Rowv = NA, #option to not order
+             scale="row",
+             color = colorPal, 
+             cexRow=0.15,
+             cexCol=0.15,
+             breaks = 0,
+             main="Unsupervised Clustering of \n AML Patient Samples")
+# dev.off()
+```
+
+```{r}
+# pheatmap::pheatmap(expn_CellType[,1:27], cluster_rows = FALSE, annotation_row = annoRow, scale = "row")
+```
+
+
+#Check Flow Data for Immune Cell Type profiles
+
+```{r}
+flow <- read.csv("../FlowCytometry/TARGET_AML_CBFGLIS_PatientUSI_27June2017-2017-7-18FD_FLOWcytometetryData.csv", stringsAsFactors = FALSE, row.names = 1)
+flow <- flow[complete.cases(flow),] #removes NAs
+head(flow[,1:5])
+```
+
+
+
+
+
+"CD7"    - high == naive Cyto T cell.     
+"HLADR"          
+"CD11b"   - low == naive Cyto T cell. myeloid marker.        
+"CD13"    - low == unstimulated T cell      
+"CD14"         
+"CD15"          
+"CD33"           
+"CD34" 
+"CD36" 
+"CD38" 
+"CD56" 
+"CD45"
+"CD117" (KIT)      
+"CD34.CV"       
+"FSC"            
+"SSC"
+
+
+```{r}
+library(reshape2)
+antigens <- c("CD34","CD56","CD38","CD45","HLADR")
+flow.melt <- flow[,c("CBFGLIS.Status",antigens)]
+flow.melt[,antigens] <- log2(flow.melt[,antigens] + 1)
+flow.melt <- melt(flow.melt, id.vars = c("CBFGLIS.Status"))
+flow.melt
+```
+
+
+```{r}
+kw <- flow.melt %>%  
+  group_by(variable) %>%
+  do(p=kruskal.test(.$value ~ as.factor(.$CBFGLIS.Status)))
+```
+
+```{r}
+kw$p %>% set_names(kw$variable)
+```
+aes(color=CBFGLIS.Status)
+
+```{r fig.height=5, fig.width=8}
+sub <- subset(flow.melt, flow.melt$variable %in% c("CD56","CD38","CD45","HLADR"))
+
+# tiff(file="CBFGLIS_vs_OtherAML_MFI_Violin_CD34_CD45_CD38_CD56_3Dec2017.tiff", height=7, width=10, units="in", res=600)
+ggplot(sub, aes(x=variable, y=value, fill=CBFGLIS.Status)) + 
+  # geom_boxplot(color="azure4") + 
+  geom_violin(draw_quantiles = c(0.25, 0.5, 0.75),color="azure4", size=1) +
+  # geom_jitter(height = 0, width = 0.3) +
+  labs(y="Log2 MFI", x="") +
+  scale_y_continuous(breaks = seq(0,13,by=2.5), limits = c(0,13)) +
+  scale_fill_manual(values = c("positive"="red", "negative"="darkblue")) + 
+  theme_numX + 
+  theme(legend.text = element_text(size=18), 
+        legend.background = element_rect(fill="white"), 
+        legend.key = element_rect(fill="white")) +
+  coord_flip()
+# dev.off()
+# getwd()
+```
+
+
+```{r fig.width=7, fig.height=5}
+library(beanplot)
+# library(vioplot)
+sub <- droplevels(sub)
+
+# tiff("CBFGLIS_0531_1031_MFI_MirrorViolinplots.tiff",height=7, width=10, units="in", res=600 )
+par(cex.lab=1.5, cex.axis=1.75, mar=c(5,6,4,2))
+beanplot( value ~ CBFGLIS.Status + variable, data=sub, side = "both",
+         ll = 0.04, col=list(c("navy","skyblue"), c("red","grey80")), ylim = c(0,14.5),
+         ylab="Log2 MFI", xlab="Antigen")
+# dev.off()
+```
+
+
+
+```{r}
+head(sub)
+```
+
+```{r}
+# ggplot(sub, aes(x=variable, y=value, fill=CBFGLIS.Status)) + 
+#   geom_boxplot(color="azure4") + 
+#   labs(y="Log2 MFI", x="") +
+#   scale_y_continuous(breaks = seq(0,13,by=2.5), limits = c(0,13)) +
+#   scale_fill_manual(values = c("positive"="red", "negative"="darkblue")) + 
+#   theme_numX + 
+#   theme(legend.text = element_text(size=18), 
+#         legend.background = element_rect(fill="white"), 
+#         legend.key = element_rect(fill="white")) + 
+
+```
+
+ 
+#Test for difference of medians 
+
+```{r}
+ggplot(flow.melt, aes(x=value, fill=variable)) +
+  geom_histogram(binwidth = 0.25) + facet_wrap(~CBFGLIS.Status, nrow=1)
+```
+
+
+#Flow Cytometry heatmap
+
+
+```{r}
+idx <- flow$CBFGLIS.Status == "positive"
+pos <- rownames(flow[idx,])
+neg <- rownames(flow[!idx, ])
+
+mfi.phenos <- phenoVectors(pos,neg)
+MFI <- t(flow[,4:16])
+
+dends.flow <- dendrograms(df = MFI, pheno = mfi.phenos, genelist = rownames(MFI), method = "mcquitty")
+# summary(dends.flow)
+```
+
+```{r fig.height=10, fig.width=10}
+colors <- ifelse(mfi.phenos == "pos", "red", "darkblue")
+
+# tiff(file="TARGET_AML_CBFGLIS_MFI_Heatmap.tif", height = 10, width=10, units = "in", res=600)
+basicHeatmap(MFI[,names(mfi.phenos)], dends.flow$c2, dends.flow$c1, colors, "MFI")
+# dev.off()
+# getwd()
+
+```
+
+
+
+
+
+
+
+The activation of CD8+ T cells is dependent on at least three signals: 1) antigenic stimulation through the TCR; 2) costimulation through molecules such as CD28, CD40, 4-1BB, CD27, ICOS, and/or OX40; and 3) stimulation through receptors for inflammatory cytokines, especially IL-12 and interferon (IFN)-α (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2836783/)
+
+NOTE: IL12 Signaling was found to be negatively enriched in GSEA PID_IL12_2PATHWAY in CBF-GLIS
+Found dn regulation of the CD8+ T cell secreted enzymes (GZM family, PRF1, GLNY)
+Oddly, TNFa highly upregulated which is an effector cytokine
+
+Analysis of cytokine profiles and levels of CD8, LFA-1 (CD18), and CTLA-4 (CD152) together revealed a pattern of expression that clearly distinguished in vivo-activated T cells from memory T cells
+
+
+CD7 identifies three populations of CD8 T cells: CD7 high (CD7(high)), low (CD7(low)), and negative (CD7(neg)) that translate into subsets with distinct functional properties. The CD7(high) subset contains naive and memory cells and the CD7(low) and CD7(neg) subsets contain effector cells. The effector cells can functionally be divided into cytokine-secreting effector CD8 T cells and lytic effector CD8 T cells. (https://www.ncbi.nlm.nih.gov/pubmed/12594257). 
+
+
+NOTE: SELL down-regulated in RNA-seq (-4.2 logFC)
+CD62L(SELL) is re-expressed on the cell surface of the activated T cells. Finally, relatively late after initial activation, sell gene activity can be modified by mechanisms that are only now being defined.  (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2836783/)
+
+ We show that CD11b is expressed on a subset of mouse CD8'T lymphocytes, and that it is a marker for T cell activation,
+cytotoxicity, and memory (http://www.jimmunol.org/content/jimmunol/149/4/1326.full.pdf). 
+
+NOTE: ANPEP (CD13) is down-regulates (-2.94 logFC)
+Recently, it was shown that aminopeptidase N (E.C. 3.4.11.2, CD13) is up-regulated during mitogenic stimulation of peripheral T-cells (http://www.sciencedirect.com/science/article/pii/S0014579397007382). 
+
+
+Here we document shifts in subset distribution within naïve (N), central memory (CM) and effector memory (EM) cells defined by CD45RA and CCR7 expression in the elderly, additionally using the costimulatory receptors CD27 and CD28 (https://immunityageing.biomedcentral.com/articles/10.1186/1742-4933-5-6) 
+
+In summary, naïve T cells are CD45RA+CD45RO–CCR7+CD62L+, central memory T cells are CD45RA–CD45RO+CCR7+CD62L+, effector memory T cells are CD45RA–CD45RO+CCR7–CD62L–, and effector cells are CD45RA+CD45RO–CCR7–CD62L–.  Thus, CD3, CD4, CD8, CD45RA or CD45RO, and CCR7 or CD62L or CD27, are a great starting point for designing flow cytometry panels for the assessment of T cells present in human PBMC.  T cells populations, however, are much more complex, and may be further classified by helper subtypes and activation status, which will be discussed in a later blog (https://technical.sanguinebio.com/basic-markers-of-t-cell-populations-in-human-pbmc/).
+
+
+
+CD45 in all leukocyte
+BLAST dimmer CD45 but always positive
+CD34 stemm cell myeloid or lymphid 
+CD38 myeloid or B lymphoid or T cells 
+HLADR immature myeloid lineage, monocytres, not mateur myeloid
+CD11b on mono, myelsoid cells. low to high as maturing cells. on some lymphoid cells, adn subset t-cells. 
+CD36 mature monocytes, erthyroid (dim on mono)
+CD15 myleodiod and dim on monocytes
+CD13 myeloid immature to mature expresion
+CD14 specifci for mature monos
+CD33 throughout myeloid prog to mature monos or myeloids. intensity varies. brightest mature monos.
+CD7 t-cell marker seee it from immature to mature. on NK cells too. Here in myeloid panel bc it can be abberantly expressed on myeloid cells. 
+CD56 NK cell normal lymphoids and T-cell subset. abberantly expressed in myeloid lineage
+CD117 cKIT from immature to myeloid cells. completely lost on maturity and lost when cell become B-cell. continuies to promyelocytic stagwe and then lost
+
+CD7, CD56, 
+
+
+
+#T-Cell Markers in RNA-sequencing Data
+
+```{r}
+T.Markers <- c("CD34", "CD38","PTPRC", "CD3E", "CD3D","CD3G","CD8A", "CD8B", "CCR7","SELL","CD27", "CD28", "CD7")
+```
+
+
+```{r}
+# pdf(file="T-Cell_CellMarkers_CBFGLISvsNormalBM_31July2017.pdf", onefile = FALSE)
+aheatmap(btc[T.Markers,c(pos,BM)],
+              annCol = data.frame(CBFvsBM$phenovector),
+              Rowv = NA, #option to not order
+             scale="row",
+             color = colorPal, 
+             cexRow=1,
+             cexCol=0.15,
+             breaks = 0,
+             main="AML vs Normal BM")
+# dev.off()
+```
+
+```{r fig.width=11, fig.height=11}
+# pdf(file="CBFGIS_vs_OtherAML_NormalBM_CD8TCell_Signature_Heatmap.pdf", onefile = FALSE)
+aheatmap(btc[T.Markers,c(pos,Neg,BM)],
+              annCol = data.frame(Group=c(LD_pheno, CBFvsBM$phenovector[-c(1:7)])),
+             scale="row",
+             color = colorPal, 
+         annColors = list(Group=c(pos="red", neg="blue", GroupB="black")),
+             cexRow=1,
+             cexCol=0.15,
+             breaks = 0,
+             main="AML vs Other AML")
+# dev.off()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

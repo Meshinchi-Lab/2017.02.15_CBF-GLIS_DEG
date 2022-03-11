@@ -1,0 +1,183 @@
+---
+title: "CBFGLIS RNAseq CNVs"
+output: html_document
+---
+
+
+Purpose: Use CAFE to identify copy number variations. 
+
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', message = FALSE, fig.width = 10, fig.height = 10)
+knitr::opts_knit$set(root.dir = '~/RNA_seq_Analysis/2017.02.15_CBF-GLIS_DEG/CBFGLISvsOtherAML/1031/')
+```
+
+```{r}
+library(stringr)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(CAFE)
+getwd()
+```
+
+
+
+#Read in the clinical Data
+
+```{r}
+CDE.0531 <- read.csv("~/reference_mapping-files/TARGET_AML_CDEs_withFusionCols_11.16.2017.csv",
+                     stringsAsFactors = FALSE, row.names = 1)
+
+head(CDE.0531)
+```
+
+```{r}
+table(CDE.0531$CBFA2T3.GLIS2)
+```
+
+
+```{r}
+CDE.1031 <- read.csv("~/reference_mapping-files/TARGET_AML_1031_CDE_cleaned_12.2.2017.csv", 
+                     stringsAsFactors = FALSE, row.names = 1)
+
+head(CDE.1031)
+```
+
+```{r}
+table(CDE.1031$CBFGLIS.Status) #from qPCR and RNAseq  results only 
+```
+
+
+#Read in the master file of seq data
+This will allow me to select a cohort of patients for whom we have WGS
+
+```{r}
+SeqData <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2017.08.18_RNAseq_TallyperPatient/TARGET_AML_0531_1031_SeqDataAvailability_11.30.17.csv", stringsAsFactors = FALSE)
+
+head(SeqData)
+```
+
+
+```{r}
+MatchedSeqData <- SeqData %>%
+  filter(WGS.DataAvailable == 1 & mRNAseq.DataAvailable == 1) %>%
+  filter(CNVs_Somatic.wgs == 1) %>%
+  filter(gene.mRNAseq == 1 | exon.mRNAseq == 1) %>%
+  filter(isoform.miRNAseq == 1) %>%
+  select(1:3,  which(grepl("mRNAseq", colnames(.))), CNVs_Somatic.wgs)
+
+MatchedSeqData
+```
+
+
+
+#Read in the expression values
+
+Units are log2(x+1) in counts per million and trimmed mean of M (TMMCPM)
+
+```{r}
+load("CBF-GLIS_vs_OtherAML_1031_DEGs.RData")
+```
+
+
+```{r}
+tpm.0531.HD <- get(load("../../ExpressionData/TARGET_AML_TPM_withGenesasRowNames_Aug2014.RData"))
+
+head(tpm.0531.HD[,1:5])
+```
+
+```{r}
+pos <- filter(CDE.0531, CBFA2T3.GLIS2=="Yes")
+neg <- filter(CDE.0531, CBFA2T3.GLIS2=="No")
+
+tpm.matched <- tpm.0531.HD %>%
+  select(which(colnames(.) %in% MatchedSeqData$USI)) %>%
+  select(which(colnames(.) %in% pos$TARGET.USI.1), which(colnames(.) %in% neg$TARGET.USI.1[1:10]))
+
+# dim(tpm.matched) #6 pos
+head(tpm.matched)
+```
+
+
+#Tumor Suppressors and Oncogenes
+
+```{r message=FALSE, warning=FALSE}
+onco <- read.table("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/ongene.bioinfo_human.txt",
+                   stringsAsFactors = FALSE, sep="\t", header = TRUE)
+
+colnames(onco)[2] <- "GeneSymbol"
+head(onco)
+# dim(onco) #751 genes
+```
+
+```{r}
+TS <- read.table("~/RNA_seq_Analysis/0000.00.02_Reference_GeneInfo/Human_TumorSuppressorGenes_bioinfo.uth.edu.txt", stringsAsFactors = FALSE, sep="\t", header = TRUE)
+
+head(TS)
+# dim(TS) #1217 tumor supressors 
+```
+
+
+```{r}
+onco.ts <- rbind(onco[,c("GeneSymbol", "Cytoband")], TS[, c("GeneSymbol","Cytoband")])
+head(onco.ts)
+```
+
+```{r}
+options(scipen = 999)
+# filter(rowSums(select(.,-rowname)) > cutoff)
+tpm.addCyto <- tpm.matched %>%
+    rownames_to_column("Gene") %>%
+    filter(rowSums(select(., -Gene)) > 5) %>%
+    inner_join(., onco.ts, by=c("Gene"="GeneSymbol")) %>%
+    mutate_if(is.numeric, function(x) log2(x+1))
+   
+
+tpm.addCyto
+```
+
+
+#Create the CAFE Lists Structure 
+
+```{r}
+USI <- grep("^PA", colnames(tpm.matched), value = TRUE)
+
+otherAMLs.Means <- tpm.addCyto %>%
+  select(Gene,which(colnames(.) %in% neg$TARGET.USI.1)) %>%
+  mutate(Mean=rowMeans(select(., -Gene)))
+  
+
+otherAMLs.Means <- as.numeric(otherAMLs.Means$Mean) #take mean before log transform? 
+otherAMLs.Means[1:5]
+```
+
+```{r}
+meansFun <- function(col){
+  col - otherAMLs.Means
+}
+
+
+whole <- list()
+for (i in 1:1){
+  
+  df <- tpm.addCyto %>%
+    select(Gene,USI[i],Cytoband) %>% 
+    mutate(LogRel=meansFun(select(.,USI[i]))[,1])
+    
+  
+}
+
+df
+```
+
+
+
+
+
+
+
+
+

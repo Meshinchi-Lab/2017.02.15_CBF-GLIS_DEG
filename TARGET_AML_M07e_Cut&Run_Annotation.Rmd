@@ -1,0 +1,502 @@
+---
+title: ''
+author: "Jenny Smith"
+date: ", 2018"
+output: html_document
+---
+
+
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8)
+knitr::opts_knit$set(root.dir = '/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/DNA/Cut_and_Run/analysis/2018.12.10_M07e_Annotate_Peaks/')
+options(stringsAsFactors = FALSE)
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(DiffBind)
+getwd()
+```
+
+
+#Example Workflow
+
+```{r}
+data("tamoxifen_peaks")
+```
+
+
+
+#Define the Sample Sheet
+
+```{r}
+samples <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/DNA/Cut_and_Run/metadata/CutnRun_Sample_List_2018June.csv", header = TRUE)
+
+head(samples)
+dim(samples)
+```
+
+```{r}
+# bedpath="/fh/scratch/delete90/meshinchi_s/jlsmith3/CutnRun/"
+bedpath="/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/DNA/Cut_and_Run/level3/peak_calls/2018June_J.Sarthy_Illumina_data/macs_peaks/"
+bedfiles <- dir(path = bedpath, 
+                pattern = "xls" ) %>%
+  .[!grepl("gapped", .)] %>%
+  data.frame(Filename=.) %>%
+  mutate(Peaks=paste0(bedpath,Filename)) %>%
+  mutate(Condition=str_split_fixed(Filename,"[_]", n=3)[,2]) %>%
+  mutate(Condition=gsub("GLIS2","Glis2", Condition)) %>%
+  select(-Filename)
+
+# bedfiles
+```
+
+```{r}
+bpath="/shared/ngs/illumina/henikoff/180614_SN367_1194_BHJ753BCX2/bowtie2/JS_HsDmSc/"
+bamfiles <- dir(path= bpath,
+                pattern=".+HsSc.+JS3[12][0-9]\\.bed") %>%
+  .[!grepl("310", .)] %>%
+  data.frame(Filename=.) %>%
+  mutate(bamReads=paste0(bpath,Filename)) %>%
+  mutate(SampleID=str_split_fixed(Filename,"[_,\\.]", n=5)[,4]) %>%
+  select(-Filename)
+  
+
+# bamfiles
+```
+
+```{r}
+samples.df <- samples %>%
+  select(SampleID=Sample.Name,Tissue=Cell.Line, Factor=Antibody, Condition=Macs_Peak_File) %>%
+  mutate(Condition=gsub("macs2Peaks.","", Condition), 
+         SampleID=gsub("F","", SampleID)) %>%
+  left_join(., bamfiles, by="SampleID") %>%
+  left_join(., bedfiles,by="Condition") %>%
+  mutate(Replicate=1, 
+         PeakCaller="macs") #or macs? 
+  
+  
+
+head(samples.df)
+# write.csv(samples.df, "CutnRun_CBFA2T3.GLIS2.csv", row.names = FALSE)
+```
+
+        Activity.Markers=case_when(
+           grepl("K27me3|no fusion", Factor) ~  "Off", 
+           grepl("K4me3|K27ac", Factor) ~ "On", 
+           grepl("CBFA2T3|Glis2", Factor) ~ "Fusion", 
+           TRUE ~ "Other")
+           
+           
+```{r}
+samples.df2 <- samples %>%
+  select(SampleID=Sample.Name,Tissue=Cell.Line, Factor=Antibody, Condition=Macs_Peak_File) %>%
+  mutate(Condition=gsub("macs2Peaks.","", Condition), 
+         SampleID=gsub("F","", SampleID)) %>%
+  left_join(., bamfiles, by="SampleID") %>%
+  left_join(., bedfiles,by="Condition") %>%
+  mutate(Replicate=1, 
+         PeakCaller="macs") %>% #or macs? 
+  filter(!grepl("IgG|CTCF|K27Ac", Factor))
+
+samples.df2
+# write.csv(samples.df2, "CutnRun_CBFA2T3.GLIS2_RemSamples.csv", row.names = FALSE)
+```
+           
+#Create DBA Object
+
+
+```{r}
+cutnrun <- dba(sampleSheet = "CutnRun_CBFA2T3.GLIS2.csv", minOverlap=1)
+cutnrun #no consensus peak sets with minOverlap=1
+```
+
+```{r}
+cutnrun2 <- dba(sampleSheet = "CutnRun_CBFA2T3.GLIS2_RemSamples.csv", minOverlap=1)
+cutnrun2
+```
+
+
+```{r}
+# dba.show(cutnrun)
+```
+
+
+```{r}
+dba.plotHeatmap(cutnrun, 
+                ColAttributes = c(DBA_CONDITION, DBA_FACTOR, DBA_TISSUE),
+                attributes = c(DBA_CONDITION), 
+                # RowAttributes = c(DBA_CONDITION),
+                distMethod = "spearman") #cant add in the condition???? attributes="DB"
+```
+
+```{r}
+dba.plotHeatmap(cutnrun2, 
+                ColAttributes = c(DBA_CONDITION, DBA_FACTOR, DBA_TISSUE),
+                attributes = c(DBA_CONDITION), 
+                # RowAttributes = c(DBA_CONDITION),
+                distMethod = "spearman") 
+```
+
+# Count Reads 
+
+```{r}
+# cutnrun <- dba.count(cutnrun, summits = 250, minOverlap=1) #doesnt appear to be working... the Frip for half of the MO7e samples are 0.00 ???
+```
+
+```{r}
+cutnrun
+```
+
+```{r}
+plot(cutnrun, attributes = c(DBA_CONDITION))
+```
+
+
+#QC plots
+
+```{r fig.height=7, fig.width=7}
+dba.plotPCA(cutnrun,DBA_TISSUE,label=DBA_CONDITION)
+```
+
+```{r}
+dba.plotPCA(cutnrun2,DBA_TISSUE,label=DBA_CONDITION)
+```
+
+
+
+#Set up Contrasts 
+
+```{r}
+cutnrun <- dba.contrast(cutnrun, categories = DBA_CONDITION, minMembers = 1)
+```
+
+
+
+#Occupancy Analysis
+
+Will use CutnRun2 with the removed samples since A) IgG peaks were already removed prior to analysis here, 2) K27Ac is more Noisy and won't be used here per suggestion by Jay Sarthy, and C) it helps improve the clustering of tissues without these additionally noisy datasets. 
+
+```{r}
+names(cutnrun2$masks)
+```
+
+```{r}
+olap.rate <- dba.overlap(cutnrun2, mode=DBA_OLAP_RATE)
+olap.rate %>% set_names(paste("Number of Peaks in At Least", seq(1:10), "Samples")) %>%
+  as.data.frame()
+```
+
+The score in the overlap results is the fold_enrichment from MACS calls it appears. 
+
+## MO7e
+
+```{r}
+#active markers 
+# cutnrun$masks$K27Ac #too noisy for now. 
+
+olap.M7.on <- dba.overlap(cutnrun2, 
+                       cutnrun2$masks$`M-07` & (cutnrun2$masks$Glis2 | cutnrun2$masks$CBFA2T3 | cutnrun2$masks$H3K4me3),
+                       mode=DBA_OLAP_PEAKS,
+                       DataType = c(DBA_DATA_GRANGES)) #can't do data.frame + granges obj. I need both. 
+
+names(olap.M7.on)
+sapply(olap.M7.on, length)
+```
+
+The scores associated with each site are derived from the peak caller confidence score, and
+are a measure of confidence in the peak call (occupancy), not a measure of how strong or
+distinct the peak is.
+
+NOTE: GLIS2 Expression is very low in K562 (BCR-ABL) and very high in MO7e. 
+Also, CBFA2T3 is very low expressed in K562 and highly expressed in MO7e. 
+
+```{r}
+head(olap.M7.on$inAll)
+# write.table(olap.M7.on$inAll, file="M0e7_CutnRun_H3K4me3_CBFA2T3_GLIS2_Peaks.bed", sep="\t", quote = FALSE,col.names = TRUE, row.names = FALSE)
+```
+
+```{r}
+olap.M7.off <- dba.overlap(cutnrun2, 
+                       cutnrun2$masks$`M-07` & (cutnrun2$masks$`Glis2 Av no fusion` | cutnrun2$masks$K27me3),
+                       mode=DBA_OLAP_PEAKS,
+                       DataType = DBA_DATA_GRANGES)
+
+names(olap.M7.off)
+
+```
+
+```{r fig.height=5, fig.width=5}
+samp <- names(which(cutnrun2$masks$`M-07` & (cutnrun2$masks$Glis2 | cutnrun2$masks$CBFA2T3 | cutnrun2$masks$H3K4me3)))
+
+labels <- samples.df2 %>%
+  filter(SampleID %in% samp)
+
+dba.plotVenn(cutnrun2, overlaps=olap.M7.on,
+             label1 =  "H3K4me3.M", label2 = "CBFA2T3.M", label3 =  "Glis2.M" )
+```
+
+
+```{r fig.height=5, fig.width=5}
+samp.off <- names(which(cutnrun2$masks$`M-07` & (cutnrun2$masks$`Glis2 Av no fusion` | cutnrun2$masks$K27me3)))
+
+labels.off <- samples.df2 %>%
+  filter(SampleID %in% samp.off)
+
+dba.plotVenn(cutnrun2, overlaps = olap.M7.off, label1="K27me3.M", label2="negGlis2.M")
+```
+
+
+## K562
+
+```{r}
+#active markers 
+# cutnrun$masks$K27Ac #too noisy for now. 
+
+olap.K.on <- dba.overlap(cutnrun2, 
+                       cutnrun2$masks$K562 & (cutnrun2$masks$Glis2 | cutnrun2$masks$CBFA2T3 | cutnrun2$masks$H3K4me3),
+                       mode=DBA_OLAP_PEAKS,
+                       DataType = c(DBA_DATA_FRAME)) #can't do data.frame + granges obj. I need both. 
+
+names(olap.K.on)
+sapply(olap.K.on, dim)
+```
+
+```{r}
+head(olap.K.on$inAll)
+```
+
+
+```{r}
+olap.K.off <- dba.overlap(cutnrun2, 
+                       cutnrun2$masks$K562 & (cutnrun2$masks$`Glis2 Av no fusion` | cutnrun2$masks$K27me3),
+                       mode=DBA_OLAP_PEAKS,
+                       DataType = DBA_DATA_GRANGES)
+
+names(olap.K.off)
+```
+
+
+```{r fig.height=5, fig.width=5}
+samp.K <- names(which(cutnrun2$masks$K562 & (cutnrun2$masks$Glis2 | cutnrun2$masks$CBFA2T3 | cutnrun2$masks$H3K4me3)))
+
+labels.K <- samples.df2 %>%
+  filter(SampleID %in% samp.K)
+
+dba.plotVenn(cutnrun2, overlaps=olap.K.on,
+             label1 =  "H3K4me3.K", label2 = "CBFA2T3.K", label3 =  "Glis2.K" )
+```
+
+
+```{r fig.height=5, fig.width=5}
+samp.off.K <- names(which(cutnrun2$masks$K562 & (cutnrun2$masks$`Glis2 Av no fusion` | cutnrun2$masks$K27me3)))
+
+labels.off.K <- samples.df2 %>%
+  filter(SampleID %in% samp.off.K)
+
+dba.plotVenn(cutnrun2, overlaps = olap.K.off, label1="K27me3.M", label2="negGlis2.M")
+```
+
+
+
+
+#Set Operations from the Results of Occupancy Analysis
+
+```{r}
+library(GenomicRanges)
+```
+
+```{r}
+class(olap.M7.on$inAll)
+class(olap.M7.off$onlyA)
+```
+
+```{r}
+# olap.M7.on$inAll
+# olap.M7.off$onlyA
+# length(olap.M7.on$inAll) # 2067
+```
+
+
+```{r}
+#For merging purposes. Could likely just conver the peak dataframe from cutnrun object to a GRanges object. will look into this. 
+
+mcols(olap.M7.off$onlyA)$score <- NULL
+mcols(olap.M7.off$onlyB)$score <- NULL
+mcols(olap.M7.off$inAll)$scoreA <- NULL
+mcols(olap.M7.off$inAll)$scoreB <- NULL
+
+#equivalent: length(c(olap.M7.off$onlyA, olap.M7.off$onlyB,olap.M7.off$inAll ))
+
+union.off <- union(olap.M7.off$onlyA, olap.M7.off$onlyB)
+union.off <- union(union.off, olap.M7.off$inAll) 
+
+class(union.off)
+length(union.off)
+```
+
+```{r}
+olap.M7.on$inAll$scoreA <- NULL
+olap.M7.on$inAll$scoreB <- NULL
+olap.M7.on$inAll$scoreC <- NULL
+
+diff <- setdiff(x=olap.M7.on$inAll, y=union.off)
+
+# diff
+# NOTE this actaully subtracts ranges from one another when they are overlapping partially. It does NOT remove the whole range (peak)
+
+length(diff) #1753 ranges 
+# write.table(as.data.frame(diff), "M0e7_CutnRun_H3K4me3_CBFA2T3_GLIS2_Minus_negGlis2_H3K27me3.bed",
+#             quote = FALSE,col.names = TRUE, row.names = FALSE, sep="\t")
+```
+
+```{r}
+K.CBFA2T3 <- makeGRangesFromDataFrame(df=cutnrun2$peaks[[8]])
+K.GLIS2 <- makeGRangesFromDataFrame(df=cutnrun2$peaks[[9]])
+
+length(c(K.CBFA2T3, K.GLIS2)) #9782
+length(union(K.CBFA2T3, K.GLIS2)) #9230
+
+# length(K.CBFA2T3)
+# length(K.GLIS2)
+```
+
+```{r}
+#How in gods sake can the number of RANGES INCREASE when getting the difference??
+#eg what is in set 1 and NOT in set 2
+#So results cant have more ranges that the input?????
+
+diff.K <- setdiff(x=diff, y=union(K.CBFA2T3, K.GLIS2), ignore.strand=TRUE)
+
+# diff.K
+length(diff.K) #2159
+
+# write.table(as.data.frame(diff.K), "M0e7_CutnRun_K4me3_CBFGLIS_Minus_glis2Neg_K27ac_K562_CBFGLIS.bed",
+#             quote = FALSE,col.names = FALSE, row.names = FALSE, sep="\t")
+```
+
+So this result actually makes sense. The GR operation is literally substracting genomic ranges that the two sets have in common. Thus one range that originally say 500pb long, and was a peak for CBFA2T3.M, GLIS2.M, and H3K4me3.M, became two ranges once a peak was detected that was 100bp long in CBFA2T3.K.  
+
+thus original:
+chr1 1 500
+
+to setdiff result:
+chr1 1    250
+chr1 350  500
+
+
+#Bedtools
+
+Will need to use Bedtools intersect the bed files from the output of DiffBind overlap. 
+
+##stringent
+
+1. bedtools intersect -wa -f 0.5 -r -a ../CBFA2T3.M_IgGremoved.narrowPeak -b ../GLIS2.M_IgGremoved.narrowPeak > MO7e_CBFA2T3_GLIS2_Peaks_0.5overlap.bed
+
+2. bedtools intersect -wa -f 0.5 -a MO7e_CBFA2T3_GLIS2_Peaks_0.5overlap.bed -b ../H3K4me3.M_IgGremoved.broadPeak > MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_0.5overlap.bed
+
+DO NOT use -r with the histone mods. Since the TF peak size is so much smaller. 
+
+3. bedtools intersect -v -a MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_0.5overlap.bed -b ../K27Ac.M_IgGremoved.broadPeak > MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_Removed_K27me3_0.5overlap.bed
+
+4. bedtools intersect -v -a MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_Removed_K27me3_0.5overlap.bed -b ../GLIS2.K_IgGremoved.narrowPeak > MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_Removed_K27me3_GLIS2.K_0.5overlap.bed
+ 
+5. bedtools intersect -v -a MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_Removed_K27me3_GLIS2.K_0.5overlap.bed -b ../CBFA2T3.K_IgGremoved.narrowPeak > MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_Removed_K27me3_GLIS2.K_CBFA2T3.K_0.5overlap_New.bed
+
+
+Number Peaks  | Intersection
+----------------------------------------------
+   316        | MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_0.5overlap.bed
+   150        | MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_Removed_K27me3_0.5overlap.bed
+   149        | MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_Removed_K27me3_GLIS2.K_0.5overlap.bed
+   107        | *MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_Removed_K27me3_GLIS2.K_CBFA2T3.K_0.5overlap.bed*
+  1335        | MO7e_CBFA2T3_GLIS2_Peaks_0.5overlap.bed
+
+
+Not satisfied with the results. There are some peaks that are missing even though visually you can see overlap and those peaks arent called in the negative control. 
+
+The issue above was resolved by removing the -r option (of course!). It meant the broad peaks of H3K4me3 would need to be 
+
+
+##default
+
+bedtools intersect -wa -a ../CBFA2T3.M_IgGremoved.narrowPeak -b ../GLIS2.M_IgGremoved.narrowPeak > MO7e_CBFA2T3_GLIS2_Peaks_1bpOverlap.bed
+
+bedtools intersect -wa -f 0.5 -a MO7e_CBFA2T3_GLIS2_Peaks_1bpOverlap.bed -b ../H3K4me3.M_IgGremoved.broadPeak > MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_1bpOverlap.bed
+
+
+Number Peaks  | Intersection
+----------------------------------------------
+   488        | MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_1bpOverlap.bed
+  1902        | MO7e_CBFA2T3_GLIS2_Peaks_1bpOverlap.bed
+  
+  
+  
+#HOMER 
+Homer/v4.9-foss-2016b
+
+##peaks
+findMotifsGenome.pl MO7e_CBFA2T3_GLIS2_H3K4Me3_Peaks_Removed_K27me3_GLIS2.K_CBFA2T3.K_0.5overlap_New.bed hg19 MO7e_New -size given -preparsedDir tmp 2> M07e_Motifs_New.out &
+
+Definitely interesting results - includes many ETS family TF, ETS-family fusions, and GATA TFs and ERG itself (which has been reported previously so is very promising). 
+
+
+##DEGs
+findMotifs.pl TARGET_AML_CBFGLIS_vs_OtherAML_DnDEGs_Interactions.txt human DnGenes_miR_Ints -start -500 -end 200 -len 8,10 2> DnGenes_miR_Ints.out  &
+
+  
+
+#Annotate with Genes
+
+```{r}
+library(ChIPpeakAnno)
+library(GenomicFeatures)
+```
+
+
+```{r}
+#For gene to peak mapping
+suppressPackageStartupMessages(require(TxDb.Hsapiens.UCSC.hg19.knownGene))
+suppressPackageStartupMessages(require(Homo.sapiens))
+txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+```
+
+https://www.biostars.org/p/85777/
+
+ You might want to use nearest() in that case. For extracting the indices from overlaps, you can use queryHits(overlaps) and subjectHits(overlaps) (have a look at help('HitsList-class') if you're unsure what the numbers there mean).
+ 
+```{r}
+#gene symbol to entrez ID conversion. 
+entrez <- org.Hs.egSYMBOL2EG[[gene.name]]
+  
+#gets genomic loci for each of UCSCs transcripts. 
+txs <- transcriptsBy(txdb, 'gene')[[entrez]] 
+  
+# subsets the ranges of genomic loci to the first bp of the gene. 
+tss <- resize(txs,width = 1, fix = 'start') 
+  
+#define the promoter region as -1kbp to +200bp of TSS
+promoter <- promoters(tss, upstream=1000, downstream=200)
+  
+#Subset the methylation set by the genomic loci on the gene
+olap.prom <- subsetByOverlaps(methylationSet, promoter)
+olap.gene <- subsetByOverlaps(methylationSet, txs)
+```
+
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+

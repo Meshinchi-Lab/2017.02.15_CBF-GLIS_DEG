@@ -1,0 +1,247 @@
+---
+title: "CD56 Transcript Level Data"
+output: html_document
+---
+
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8)
+knitr::opts_knit$set(root.dir = '~/RNA_seq_Analysis/2018.03.21_CBF-GLIS_DEGs_Comprehensive/')
+options(stringsAsFactors = FALSE)
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+getwd()
+```
+
+
+
+#Read in the Clinical Data
+
+```{r}
+CDE.all <- read.csv("~/reference_mapping-files/TARGET_AML_0531_1031_merged_CDEs_1.10.19.csv")
+
+CDE.all <- CDE.all %>%
+  filter(!is.na(USI)) %>%
+  set_rownames(.$USI)
+
+
+head(CDE.all[,1:5])
+dim(CDE.all)
+```
+
+
+#Read in the Expression Data
+
+```{r}
+TPMs <- read.csv("~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/TARGET_AML_MPN_1031_kallisto_withGeneID_TPM.csv")
+
+head(TPMs[,1:5])
+dim(TPMs) # 180253   1515
+```
+
+```{r}
+#Derived from Manifest R Script and renameRNAseq_batchDuplicates.sh
+
+replicates=("TARGET-20-PAXLDJ-09A-01R TARGET-20-PAXGYZ-03A-01R TARGET-20-PAXEBW-09A-01R TARGET-20-PAWTSD-09A-01R TARGET-20-PAWMHE-09A-01R TARGET-20-PAWKIW-03A-01R TARGET-20-PAWEYY-09A-01R TARGET-20-PAVWRI-09A-01R TARGET-20-PAVTRU-09A-01R TARGET-20-PAVHWK-09A-01R TARGET-20-PAVBVP-09A-01R TARGET-20-PAUVIB-09A-01R TARGET-20-PAUUTI-09A-01R TARGET-20-PATISD-09A-01R TARGET-20-PATGIG-03A-01R TARGET-20-PATESX-09A-01R TARGET-20-PASRLS-09A-01R TARGET-20-PASLTF-09A-01R TARGET-20-PASIEJ-09A-01R TARGET-20-PARVSF-09A-01R TARGET-20-PALHWN-09A-01R TARGET-00-BM5776-14A-01R TARGET-00-BM5759-14A-01R TARGET-00-BM5756-14A-01R TARGET-00-BM5751-14A-01R TARGET-00-BM5682-14A-01R TARGET-00-BM5233-14A-01R TARGET-00-BM5136-09A-01R TARGET-00-BM5108-09A-01R TARGET-00-BM4641-14A-01R TARGET-00-BM4616-14A-01R TARGET-00-BM4508-14A-01R TARGET-00-BM4473-14A-01R TARGET-00-BM4404-14A-01R TARGET-00-BM4203-14A-01R TARGET-00-BM3969-14A-01R TARGET-00-BM3897-14A-01R") %>%
+  str_split(., " ") %>%
+  unlist() %>%
+  gsub("\\-", "\\.", .)
+
+replicates
+```
+
+```{r}
+# rep.in.TPMs <- intersect(colnames(TPMs), replicates) %>%
+#   .[order(.)]
+# 
+# length(rep.in.TPMs) #16 NBM
+
+#update Replicates 
+for (rep in replicates){
+
+  i <- grep(rep, colnames(TPMs))
+  n <- paste0(rep,"_replicate")
+  colnames(TPMs)[i] <- n
+  
+}
+
+```
+
+
+```{r}
+TPMs <- TPMs[,!grepl("replicate",colnames(TPMs))]
+TPMs <- TPMs[,!grepl("MPN[0-9]",colnames(TPMs))]
+
+
+write.csv(TPMs,"~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/TARGET_AML_1031_kallisto_withGeneID_TPM.csv")
+dim(TPMs) #1464
+```
+
+
+```{r}
+gene.counts <- read.csv("~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/TARGET_AML_AAML1031_dupGenesRemoved_TPM.csv", row.names=1)
+
+head(gene.counts[,1:5])
+dim(gene.counts) #51573  1111
+```
+
+
+
+
+#CD56 
+
+```{r}
+NCAM1 <- TPMs %>%
+  filter(grepl("^NCAM1$", gene_name, ignore.case = TRUE)) %>%
+  dplyr::select(transcript_id, everything(), -gene_id, -gene_name, -transcript_name) %>%
+  gather(var,val, -transcript_id) %>%
+
+  group_by(var) %>%
+  mutate(DominantSpecies=ifelse(val==max(val), transcript_id, "NotDominant")) %>%
+  mutate(DominantSpecies=ifelse(val==max(val) & max(val) == 0,"NotExpressed",DominantSpecies)) %>%
+  
+  #messily fix ties. Pick the first one
+  mutate(D2=case_when(
+    sum(grepl("^ENST", DominantSpecies)) > 1 ~ DominantSpecies[grep("^ENST", DominantSpecies)[1]], 
+    TRUE ~ DominantSpecies)) %>% 
+  
+  #change any entries with two "ENST" dominant species to "not dominant" status
+  group_by(var,DominantSpecies) %>%
+  mutate(D3=case_when(
+    sum(grepl("^ENST", D2)) == n() & DominantSpecies != unique(D2)  ~ "NotDominant",
+    TRUE ~ DominantSpecies)) %>%
+  ungroup() %>%
+  
+  #change the column Domincant species the intermediate column called D3
+  mutate(DominantSpecies=D3) %>%
+  dplyr::select(transcript_id,var,val,DominantSpecies,-D2,-D3) %>%
+  
+  #makes NAs to zeros and collapse the rows using sum()
+  group_by(var) %>%
+  spread(transcript_id, val) %>%
+  mutate_at(vars(matches("^ENST")), funs(replace(.,is.na(.),0))) %>%
+  mutate_at(vars(matches("^ENST")), funs(sum)) %>%
+  ungroup() %>%
+  
+  #remove not dominant entries (these are duplicates at this point) and define groups
+  filter(DominantSpecies != "NotDominant") %>%
+  mutate(Group=case_when(
+    grepl("BM[0-9]|RO[0-9]", var) ~ "NBM", 
+    grepl("MPN", var) ~ "MPN",
+    TRUE ~ "AML")) %>%
+  
+  #sum the transcripts TPMs to get a total  count for the gene level expression
+  dplyr::select(var,Group, everything()) %>%
+  mutate(TotalCD56=dplyr::select(., contains("ENST")) %>% rowSums()) %>%
+  mutate(USI=gsub("TARGET.20.|TARGET.00.|\\.0[0-9]A.+", "", var)) %>%
+  
+  #Add annotations from the clincial data
+  left_join(., dplyr::select(CDE.all,
+                      CBFA2T3.GLIS2, 
+                      USI, 
+                      FAB_or_WHO.Classification, 
+                      Primary.Cytogenetic.Code), by=c("USI")) %>%
+  
+  #Update CBFA2T3.GLIS2 to include stella and change others to NBM or unknown. 
+  mutate(CBFA2T3.GLIS2=case_when(
+    USI == "S.1327" ~ "Yes", #manually change bc she is not in the CDEs. Stella
+    Group == "NBM" ~ "NBM",
+    is.na(CBFA2T3.GLIS2) ~ "Unknown",
+    TRUE ~ CBFA2T3.GLIS2)) %>%
+  
+  dplyr::select(var,USI,Group,CBFA2T3.GLIS2,
+                FAB_or_WHO.Classification,Primary.Cytogenetic.Code, everything())
+  
+  
+options(scipen = 999)
+head(NCAM1[,1:5])
+dim(NCAM1)
+# write.csv(NCAM1,"~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/Transcript_Level_Subsets/TARGET_AML_1031_NCAM1_Transcript_Expression_TPM.csv", row.names = FALSE)
+```
+
+
+```{r}
+table(NCAM1$Group)
+```
+
+
+
+#Add in Gene Level Counts 
+
+```{r}
+gene.counts.m <- gene.counts %>%
+  rownames_to_column("Gene") %>%
+  filter(Gene=="NCAM1") %>%
+  gather(USI,TPM_Gene.Counts,-Gene)
+
+
+head(gene.counts.m)
+dim(gene.counts.m)
+```
+
+
+```{r}
+NCAM1.update <- NCAM1 %>%
+  inner_join(., gene.counts.m, by="USI")
+  
+
+head(NCAM1.update)
+
+# write.csv(NCAM1.update,"TARGET_AML_1031_NCAM1_Kallisto_BCCA_TPM.csv", row.names = FALSE)
+```
+
+
+
+
+
+#Violin Plots 
+
+
+```{r}
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/ggplot_Themes_Function.r")
+```
+
+
+```{r}
+NCAM1 <- NCAM1 %>%
+  mutate(NCAM1.log2=log2(TotalCD56+0.5)) %>%
+  mutate(CBFA2T3.GLIS2=factor(CBFA2T3.GLIS2, levels=c("Yes", "No", "Unknown", "NBM")))
+
+quantile(unlist(NCAM1$NCAM1.log2))
+```
+
+
+```{r fig.width=10, fig.height=5}
+library(ggpubr)
+
+# tiff("TARGET_AML_1031_CD56_Transcript_Level_Expression_ViolinPlots.tiff", height = 5, width = 10, units="in", res=600)
+ggviolin(NCAM1,x="CBFA2T3.GLIS2", y="NCAM1.log2", fill="CBFA2T3.GLIS2",
+                draw_quantiles = c(0.5), color="azure3") +
+  labs(y="Log2(TPM + 0.5)", x="") + 
+  scale_fill_brewer(palette = "Set1") + 
+  theme_numX
+# dev.off()
+```
+
+
+
+
+
+
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```

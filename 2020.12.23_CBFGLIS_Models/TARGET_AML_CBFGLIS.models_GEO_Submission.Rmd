@@ -1,0 +1,281 @@
+---
+title: "Create Submission Manifest for CBFGLIS Cord Blood Samples"
+author: "Jenny Smith"
+date: "August 9, 2021"
+output: html_document
+---
+
+# Set-up 
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2017.02.15_CBF-GLIS_DEG/2020.12.23_CBFGLIS_Models/"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+node=Sys.info()[["nodename"]]
+if(!grepl("local", node)){
+  print(node)
+  options(bitmapType = 'cairo')
+  grDevices::X11.options(type='cairo')
+}
+
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+
+library(ggplot2)
+library(gridExtra)
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+
+library(DeGSEA)
+
+getwd()
+```
+
+
+
+# ClinData
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_05.21.21.csv"),
+                   na.strings = c("#N/A", "NA", ".",""))
+
+merged <- merged %>% 
+  dplyr::filter(!grepl("Unknown", USI)) %>%
+  dplyr::filter(Eligibility_Comments != "remove")
+
+
+dim(merged) #2217  150
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET,
+                                    "SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_06.09.21.csv")) 
+
+dim(sample_info)
+table(sample_info$Batch)
+```
+
+```{r}
+CBFGLIS.models <- read.csv("TARGET_AML_CBFGLIS_CordBlood_Models_Sample_Conditions.csv")
+
+# head(CBFGLIS.models)
+dim(CBFGLIS.models) #50 56
+# View(CBFGLIS.models)Ω
+```
+
+```{r}
+CBFGLIS_samples <- CBFGLIS.models %>%  
+  filter(grepl("CordBlood", AML_Subtype), !grepl("sort", Sample)) %>%
+  filter(!grepl("mock", Transduction_condition)) %>% 
+  mutate_at(vars(Time_Point_Group), ~case_when(
+    .=="Week7" ~ gsub("7", "6", .),
+    TRUE ~ .)) %>% 
+  mutate(Comparisons=paste(Culture_condition, Time_Point_Group, AML_Subtype, sep="_")) %>%
+  filter(!grepl("34pos_Week0|Week9|Myeloid_Week12|Myeloid_Week6_GFP", Comparisons)) %>% 
+  arrange(AML_Subtype) %>% 
+  set_rownames(.$Sample)
+
+
+
+dim(CBFGLIS_samples)
+table(CBFGLIS_samples$Comparisons)
+# table(CBFGLIS_samples$Transduction_condition)
+```
+
+# Rename Samples
+
+```{r}
+CBFGLIS_samples <- CBFGLIS_samples %>% 
+  mutate(GEO_Sample=case_when(
+    grepl("EC_Week1_CBFGLIS_CordBlood", Comparisons) ~ "CG-CB_EC_Wk1",
+    grepl("EC_Week1_GFP_CordBlood", Comparisons) ~ "GFP-CB_EC_Wk1",
+    grepl("EC_Week12_CBFGLIS_CordBlood", Comparisons) ~ "CG-CB_EC_Wk12",
+    grepl("EC_Week6_CBFGLIS_CordBlood", Comparisons) ~ "CG-CB_EC_Wk6",
+    grepl("Myeloid_Week1_CBFGLIS_CordBlood", Comparisons) ~ "CG-CB_MC_Wk1",
+    grepl("Myeloid_Week1_GFP_CordBlood", Comparisons) ~ "GFP-CB_MC_Wk1",
+    grepl("Myeloid_Week6_CBFGLIS_CordBlood", Comparisons) ~ "CG-CB_MC_Wk6")) %>% 
+  group_by(Comparisons) %>% 
+  mutate_at(vars(GEO_Sample), ~paste0(.,"_rep",1:n()))  %>% 
+  ungroup() %>% 
+  arrange(GEO_Sample) %>% 
+  select(Sample, GEO_Sample, PATIENT_ID_Original, Comparisons, everything())
+
+any(duplicated(CBFGLIS_samples$GEO_Sample))
+```
+
+
+## Expression Matrix 
+
+```{r}
+# dir("Expression_Data/")
+# CBFGLIS_samples
+```
+
+```{r}
+cts <- readRDS("Expression_Data/TARGET_AML_CBFGLIS_Models_geneLevel_scaledTPM_counts.RDS")
+cts <- cts[,CBFGLIS_samples$Sample]
+colnames(cts) <- CBFGLIS_samples$GEO_Sample
+
+
+dim(cts)
+head(cts[,1:5]) # 59853    23
+
+# write.table(cts, "GEO_Submission/CBFA2T3-GLIS2_HSPCs_and_GFP_HSPCs_raw_counts.txt", sep="\t", quote = FALSE)
+```
+
+```{r}
+TPM <- readRDS("Expression_Data/TARGET_AML_CBFGLIS_Models_geneLevel_TPM_abundance.RDS")
+TPM <- TPM[,CBFGLIS_samples$Sample]
+colnames(TPM) <- CBFGLIS_samples$GEO_Sample
+
+dim(TPM)
+head(TPM[,1:5])
+
+# write.table(TPM, "GEO_Submission/CBFA2T3-GLIS2_HSPCs_and_GFP_HSPCs_normalized_transcripts_per_million.txt", sep="\t", quote = FALSE)
+```
+
+
+## GEO Metadata
+
+```{r}
+metafile <- openxlsx::read.xlsx("GEO_Submission/seq_template.xlsx")
+
+# head(metafile)
+```
+
+```{r}
+fqs <- dir(file.path(SCRATCH,"/jlsmith3/CBFGLIS/picard"), pattern = "*[12].fq.gz$")
+names(fqs) <- gsub("^(.+01R).+", "\\1", fqs)
+
+
+# length(fqs)
+# table(names(fqs) %in% CBFGLIS_samples$PATIENT_ID_Original)
+
+in_fqs <- data.frame(rawfile=fqs[names(fqs) %in% CBFGLIS_samples$PATIENT_ID_Original]) %>% 
+  mutate(PATIENT_ID_Original=names(fqs[names(fqs) %in% CBFGLIS_samples$PATIENT_ID_Original])) %>% 
+  arrange(PATIENT_ID_Original) %>% 
+  mutate(read=ifelse(grepl("_r1",rawfile), "r1", "r2")) %>% 
+  pivot_wider(id_cols=PATIENT_ID_Original,
+              values_from=rawfile,
+              names_from=read)
+  
+in_fqs
+```
+
+ Sample name |	title	| source name	| organism |	characteristics: tag	characteristics: tag	characteristics: tag |	molecule |	description	| processed data file |	raw file	| raw file
+
+```{r}
+sample_metafile <- CBFGLIS_samples %>% 
+  left_join(., in_fqs, by=c("PATIENT_ID_Original")) %>% 
+  mutate_at(vars(Transduction_condition), ~gsub("GLIS","GLIS2", .)) %>% 
+  mutate(title=Comparisons, 
+         organism="Homo sapiens",
+         molecule="total RNA",
+         description="",
+         `processed data file`="CBFA2T3-GLIS2_HSPCs_and_GFP_HSPCs_normalized_transcripts_per_million.txt") %>% 
+  group_by(GEO_Sample) %>% 
+  mutate_at(vars(r1,r2), ~gsub("^TARGET.+01R", GEO_Sample, .)) %>% 
+  ungroup() 
+
+sample_metafile.final <- sample_metafile %>% 
+  select(`Sample name`=GEO_Sample,
+         title,
+         `source name`=Tissue,
+         organism,
+         `characteristics: Culture_condition`=Culture_condition,
+         `characteristics: Transduction_condition`=Transduction_condition,
+         `characteristics: Time_Point_Group`=Time_Point_Group,
+         `characteristics: group`=AML_Subtype,
+         molecule,
+         description,
+         `processed data file`,
+         r1,
+         r2)
+
+
+sample_metafile.final
+# write.csv(sample_metafile.final, "GEO_Submission/TARGET_AML_CBFGLIS.models_sample_metadata.csv", row.names = FALSE)
+```
+
+file name	| file type |	file checksum |	instrument model |	single or paired-end
+
+```{r}
+md5 <- dir(file.path(SCRATCH,"/jlsmith3/CBFGLIS/picard"), pattern = "*md5$", full.names = T)
+
+ 
+md5s <-  lapply(md5, read.table, header=FALSE, sep=" ") %>% 
+  bind_rows() %>% 
+  select(`file name`=V3, `file checksum`=V1) %>%
+  mutate_at(vars(`file name`), ~basename(.)) %>% 
+  mutate(PATIENT_ID_Original=gsub("^(.+01R).+", "\\1", `file name`)) %>% 
+  inner_join(.,select(sample_metafile, PATIENT_ID_Original, GEO_Sample),
+             by="PATIENT_ID_Original") %>% 
+  arrange(GEO_Sample) %>% 
+  
+  rowwise() %>% 
+  mutate(newfilename=gsub("^TARGET.+01R", GEO_Sample, `file name`)) %>% 
+  ungroup() %>% 
+  
+  mutate(`file type`="fastq",
+         `instrument model`="Illumina HiSeq 2500",
+         `single or paired-end`="paired-end") %>%
+  select(`file name`,newfilename, `file type`, `file checksum`,
+         `instrument model`, `single or paired-end`)
+
+md5s
+# any(duplicated(md5s$newfilename))
+
+# write.csv(md5s,"GEO_Submission/TARGET_AML_CBFGLIS.models_raw_data_metadata.csv", row.names = FALSE, quote = FALSE)
+```
+
+```{r}
+remake_md5checks <- purrr::map(1:nrow(md5s),function(i){
+  
+  df <- md5s %>% 
+    slice(i)
+  
+  filename <- paste0(pull(df, newfilename),".md5")
+  dest <- file.path(SCRATCH,"jlsmith3/CBFGLIS/GEO")
+
+  write.table(select(df, `file checksum`, newfilename),
+              file=file.path(dest, filename),
+              sep=" ", quote=FALSE, row.names=FALSE, col.names=FALSE)
+  
+})
+```
+
+
+```{bash eval=FALSE}
+cd /fh/scratch/delete90/meshinchi_s/jlsmith3/CBFGLIS/picard
+for line in $(cat ../GEO/TARGET_AML_CBFGLIS.models_raw_data_metadata.csv | grep -v "file"); 
+do 
+  oldfile=$(echo $line | cut -f 1 -d ","); 
+  newfile=$(echo $line | cut -f 2 -d ","); 
+  cp -v $oldfile ../GEO/$newfile ;
+done
+```
+
+
+
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+

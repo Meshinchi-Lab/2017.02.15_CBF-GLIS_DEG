@@ -1,0 +1,1106 @@
+---
+title: "Survival Analysis in CBF-GLIS2"
+output: html_document
+---
+
+#Set-up
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', message = FALSE, fig.width = 10, fig.height = 10)
+knitr::opts_knit$set(root.dir = '~/RNA_seq_Analysis/2018.03.21_CBF-GLIS_DEGs_Comprehensive/')
+options(stringsAsFactors = FALSE)
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(RColorBrewer)
+getwd()
+```
+
+
+```{r}
+# source("~/scripts/survival_analysis/Survplot_Functions_2017.03.31.r")
+source("~/scripts/survival_analysis/Survplot_Functions_2018.10.24.r")
+```
+
+Updated to use only eligables from Tod and Rob. 
+Also updated to include all of the RBD fusion calls for CBFGLIS 
+
+
+#Read in the clinical Data 
+
+```{r}
+CDE.all <- read.csv("~/reference_mapping-files/TARGET_AML_0531_1031_merged_CDEs_3.01.19.csv", 
+                     stringsAsFactors = FALSE)
+
+CDE.all <- CDE.all %>% 
+  filter(!is.na(USI)) %>%
+  filter(Patient.Eligable.For.Bio.Study == "Yes") %>%
+  
+  filter(CBFA2T3.GLIS2!="Unknown") %>%
+  mutate(CBFA2T3.GLIS2=gsub("Intermediate", "Yes", CBFA2T3.GLIS2)) %>%
+  mutate(AML=rep("AML", nrow(.))) %>% 
+  
+  mutate(Risk.group=ifelse(grepl("[0-9]",Risk.group), "Unknown", Risk.group)) %>%
+  set_rownames(.$USI)
+
+
+head(CDE.all[,1:5])
+dim(CDE.all) #1927  174
+```
+
+
+```{r}
+# write.csv(CDE.all, "TARGET_AML_0531_1031_merged_CDEs_forCBFLGIS_10.22.18.csv")
+```
+
+
+
+```{r}
+#Its stella that is missing. 
+table(CDE.all$CBFA2T3.GLIS2)
+# CDE.all %>%
+#   filter(CBFA2T3.GLIS2 == "Yes") %>%
+#   select(Reg.) %>%
+#   unlist() %>%
+#   cat(., file="TARGET_AML_1031_CBFGLIS_Reg_10.19.18.txt", sep="\n")
+```
+
+
+```{r}
+CDE.all %>% 
+  filter(CBFA2T3.GLIS2 == "Yes") %>% 
+  select(Protocol) %>% 
+  table()
+```
+
+
+
+#Survival models 
+
+```{r}
+CDE.all <- CDE.all %>%
+  mutate(M7_AML=relevel(as.factor(M7_AML), ref="No"),
+         CBFA2T3.GLIS2=relevel(as.factor(CBFA2T3.GLIS2), ref="No"),
+         Risk.group=relevel(as.factor(Risk.group), ref="Standard"))
+```
+
+
+##OS
+
+```{r}
+OS.cols <- c("Overall.Survival.Time.in.Days", "OS.ID")
+SurvData.OS <- SurvObjects(df=CDE.all, colNames=OS.cols, group="CBFA2T3.GLIS2", time="DtoY")
+# save(SurvData.OS, file="TARGET_AML_1031_0531_OverallSurvival_KM_Coxph_Res_10.22.18.RData")
+```
+
+```{r}
+# summary(SurvData.OS$survFit, times = seq(0,5,by=0.5))
+```
+
+
+##M7s as a whole
+
+```{r}
+M7.OS <- SurvObjects(df=droplevels(filter(CDE.all, M7_AML != "Unknown")), colNames = OS.cols, group="M7_AML", time="DtoY")
+M7.OS$survFit$n
+coxSummaryTable(M7.OS$CoxPH)
+# summary(M7.OS$survFit, times=c(0,3,5))
+```
+
+
+##M7s in CBFGLIS
+
+```{r}
+M7.CBF <- SurvObjects(df=droplevels(filter(CDE.all, CBFA2T3.GLIS2=="Yes", M7_AML!="Unknown")), 
+                      colNames = OS.cols, group = "M7_AML", time="DtoY")
+M7.CBF$survFit$n
+coxSummaryTable(M7.CBF$CoxPH)
+# summary(M7.CBF$survFit, times=c(0,3,5))
+```
+
+
+## Cyto/Mol Risk Group
+
+```{r}
+rg.OS <- SurvObjects(df=droplevels(filter(CDE.all, Risk.group != "Unknown")),
+                     colNames = OS.cols, group="Risk.group", time="DtoY")
+
+rg.OS$survFit$n
+coxSummaryTable(rg.OS$CoxPH)
+summary(rg.OS$survFit, times=c(0,3,5))
+```
+
+
+
+##multivariate
+
+```{r}
+mcox.os <- coxph(Surv(Overall.Survival.Time.in.Days,OS.ID) ~ CBFA2T3.GLIS2 + 
+                   Risk.group + 
+                   M7_AML, 
+                 data = droplevels(filter(CDE.all, 
+                               M7_AML != "Unknown", 
+                               Risk.group != "Unknown")))
+
+mtab <- coxSummaryTable(mcox.os)
+mtab
+# write.csv(mtab,"multivariate_coxmod_OS.csv", row.names = FALSE)
+```
+
+```{r message=FALSE, warning=FALSE}
+filter(CDE.all, M7_AML != "Unknown", Risk.group != "Unknown") %>%
+  select(USI,M7_AML, Risk.group) %>%
+  gather(var,val, -USI) %>%
+  group_by(var,val) %>%
+  summarise(N=n())
+
+```
+
+
+
+
+##EFS 
+
+```{r}
+EFS.cols <- c("Event.Free.Survival.Time.in.Days", "Event.ID")
+
+SurvData.EFS <-  SurvObjects(df=CDE.all, colNames=EFS.cols, group="CBFA2T3.GLIS2", time="DtoY")
+
+# save(SurvData.EFS, file="TARGET_AML_1031_0531_EventFreeSurvival_KM_Coxph_Res_10.22.18.RData")
+```
+
+```{r}
+summary(SurvData.EFS$CoxPH)
+SurvData.EFS$PH_Test #NS
+```
+
+```{r}
+summary(SurvData.EFS$survFit, times = seq(0,5,by=0.5))
+```
+
+
+##M7s as a whole
+
+```{r}
+M7.EFS <- SurvObjects(df=droplevels(filter(CDE.all, M7_AML != "Unknown")), 
+                      colNames = EFS.cols, group="M7_AML", time="DtoY")
+M7.EFS$survFit$n
+coxSummaryTable(M7.EFS$CoxPH)
+summary(M7.EFS$survFit, times=c(0,3,5))
+```
+
+
+##M7s in CBFGLIS
+
+```{r}
+M7.CBF.EFS <- SurvObjects(df=droplevels(filter(CDE.all, CBFA2T3.GLIS2=="Yes", M7_AML!="Unknown")), 
+                      colNames = EFS.cols, group = "M7_AML", time="DtoY")
+
+M7.CBF.EFS$survFit$n
+coxSummaryTable(M7.CBF.EFS$CoxPH)
+summary(M7.CBF.EFS$survFit, times=c(0,3,5))
+```
+
+
+##multivariate
+
+```{r}
+mcox.EFS <- coxph(Surv(Event.Free.Survival.Time.in.Days,Event.ID) ~ CBFA2T3.GLIS2 + 
+                   Risk.group + 
+                   M7_AML, 
+                 data = droplevels(filter(CDE.all, 
+                               M7_AML != "Unknown", 
+                               Risk.group != "Unknown")))
+
+mtab.EFS <- coxSummaryTable(mcox.EFS)
+mtab.EFS
+# write.csv(mtab.EFS,"multivariate_coxmod_EFS.csv", row.names = FALSE)
+```
+
+
+
+
+#Kaplan Meier Plots
+
+```{r}
+KM.plots.1031 <-  KM.plots(df=CDE.all, 
+                          groupBy = "AML",
+                          type = "OS", 
+                          covariate = "CBFA2T3.GLIS2", 
+                          cohort = "0531", 
+                          cc = c("Yes"="red", "No"="Navy"),
+                          riskTable = TRUE)
+
+KM.plots.1031
+```
+
+
+```{r fig.height=6, fig.width=5.5}
+# tiff("TARGET_AML_1031_OS_blackborder_KMplot.tiff", height = 6, width=5.5, units="in", res=600)
+plot(KM.plots.1031$OS[[1]]) 
+# dev.off()
+```
+
+
+```{r fig.height=6, fig.width=5.5}
+# tiff("TARGET_AML_1031_EFS_blackborder_KMplot.tiff", height = 6, width=5.5, units="in", res=600)
+plot(KM.plots.1031$EFS[[1]])
+# dev.off()
+```
+
+
+```{r}
+KM.plots.M7 <- KM.plots(df=filter(CDE.all, M7_AML != "Unknown"), 
+                        groupBy = "AML",
+                        covariate = "M7_AML",
+                        cohort = "0531",
+                        cc = c("Yes"="darkred","No"="dodgerblue4"),
+                        riskTable = TRUE)
+```
+
+```{r fig.height=6, fig.width=5.5}
+# tiff("TARGET_AML_1031_M7s_OS_blackborder_KMplot.tiff", height = 6, width=5.5, units="in", res=600)
+plot(KM.plots.M7$OS[[1]])
+# dev.off()
+```
+
+```{r fig.height=6, fig.width=5.5} 
+# tiff("TARGET_AML_1031_M7s_EFS_blackborder_KMplot.tiff", height = 6, width=5.5, units="in", res=600)
+plot(KM.plots.M7$EFS[[1]])
+# dev.off()
+```
+
+```{r}
+df <- CDE.all %>%
+  filter(M7_AML == "Yes" | CBFA2T3.GLIS2 == "Yes") %>%
+  filter(M7_AML != "Unknown") %>%
+  mutate(M7.withGlis=paste(CBFA2T3.GLIS2, M7_AML, sep="_")) %>%
+  mutate_at(vars(M7.withGlis), funs(case_when(
+    . == "No_Yes" ~ "Other M7",
+    . == "Yes_Yes" ~ "Fusion+ M7",
+    . == "Yes_No" ~ "Fusion+ nonM7")))
+    # . == "Yes_Unknown" ~ "Fusion+ Unk")))
+```
+
+```{r}
+KM.plots.M7Glis <- KM.plots(df=df,
+                            groupBy = "AML",
+                            covariate = "M7.withGlis",
+                            cohort = "0531",
+                            f.levels = c("Other M7",
+                                         # "Fusion+ Unk",
+                                         "Fusion+ nonM7", 
+                                         "Fusion+ M7"),
+                            cc = c("Fusion+ M7"="darkred",
+                                   "Fusion+ nonM7"="red",
+                                   "Other M7"="Navy"),
+                                   # "Fusion+ Unk"="dark grey"), 
+                            max.year=10,
+                            riskTable = TRUE)
+```
+
+
+```{r fig.height=6, fig.width=7}
+# tiff("TARGET_AML_1031_CBFGLIS.M7s_OS_blackborder_rmUnknown_KMplot.tiff", height = 6, width=7, units="in", res=600)
+plot(KM.plots.M7Glis$OS[[1]])
+# dev.off()
+```
+
+
+```{r fig.height=6, fig.width=5.5}
+# tiff("TARGET_AML_1031_CBFGLIS.M7s_EFS_blackborder_KMplot.tiff", height = 6, width=7, units="in", res=600)
+plot(KM.plots.M7Glis$EFS[[1]])
+# dev.off()
+```
+
+
+```{r}
+df2 <- CDE.all %>%
+  mutate(Age.Glis=paste(CBFA2T3.GLIS2, Age.Category, sep="_"))
+
+KM.Glis.Age <- KM.plots(df=df2, groupBy = "AML", covariate = "Age.Glis", cohort="0531", riskTable = FALSE)
+
+KM.Glis.Age$OS
+```
+
+
+
+
+#Relapse Risk?
+
+Should i do relapse risk and DFS? it would only be for the 1031 AMLs 
+
+
+
+#Clinical Characteristics Table and Plots
+
+```{r message=FALSE}
+library(compareGroups)
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/ggplot_Themes_Function.r")
+```
+
+```{r}
+dat.all <- CDE.all %>%
+  filter(Protocol == "AAML1031" | Protocol == "AAML0531") %>% #using only these two for the tables and plot by COG
+  
+  select(USI,Reg., ISCN,
+         Protocol, CBFA2T3.GLIS2, Age.Category, Age.Yrs,
+         Gender, Race, Ethnicity, 
+         WBC.at.Diagnosis, Bone.marrow.leukemic.blast.percentage...., Peripheral.blasts....,
+         EMD=Was.the.patient.diagnosed.with.non.CNS.extramedullary.disease.,CNS=CNS.disease.at.on.study,
+         Risk.group,Primary.Cytogenetic.Code,
+         NPM.mutation, CEBPA.mutation,FLT3.ITD.positive.,
+         FAB_or_WHO.Classification, RAM.phenotype,
+         matches("^t.|^inv|^del|^MLL$|^mono|^Minus"), M6_AML, M7_AML,
+         matches("DEK|KDM5A|NSD1|RBM15"), 
+         matches("MRD\\.|CR.status")) %>%
+  
+  mutate(EMD=gsub("\\.", "Unknown", EMD)) %>%
+  mutate(EMD.NotCNS3=case_when(
+    CNS == "CNS3" & EMD == "Yes" ~ "CNS.EMD+", 
+    CNS != "CNS3" & EMD == "Yes" ~ "EMD+", 
+    TRUE ~ EMD)) %>%
+  
+  mutate(LessThan1yr=ifelse(Age.Yrs < 1.0, "LessThan_1yr", "No"), 
+         age1yr=ifelse(Age.Yrs >= 1.0 & Age.Yrs < 2.0, "1yr_olds", "No"), 
+         age2yr=ifelse(Age.Yrs >= 2.0 & Age.Yrs < 3.0, "2yr_olds", "No"),
+         age3yr=ifelse( Age.Yrs >= 3.0 & Age.Yrs < 4.0, "3yr_olds", "No")) %>%
+  
+  
+  mutate_at(vars(matches("DEK|KDM5A|NSD1|RBM15")), funs(gsub("Intermediate", "Yes", .))) %>%
+  mutate(Age.Category=factor(Age.Category, levels=c("Less than 3 years","Between 3 and 5 years",
+                                                    "Between 5 and 10 years","Between 10 and 18 years",
+                                                    "Greater than 18 years")))
+
+dim(dat.all) #1761 patients
+# colnames(dat.all)
+
+# write.csv(filter(dat.all, CBFA2T3.GLIS2=="Yes"),"TARGET_AML_0531_1031_CBFGLIS_Detailed_Clinical_Anno.csv", row.names = FALSE)
+```
+
+```{r}
+dat.all %>%
+  select(CBFA2T3.GLIS2, USI, FAB_or_WHO.Classification) %>%
+  filter(grepl("^M[0-9]", FAB_or_WHO.Classification)) %>%
+  group_by(CBFA2T3.GLIS2,FAB_or_WHO.Classification) %>%
+  summarise(Number=n())
+
+```
+
+```{r}
+FAB <- dat.all %>%
+  select(CBFA2T3.GLIS2, USI, FAB_or_WHO.Classification) %>%
+  mutate(FAB=FAB_or_WHO.Classification) %>%
+  filter(CBFA2T3.GLIS2=="Yes", FAB != "Unknown") %>%
+  mutate_at(vars(FAB), funs(case_when(
+    grepl("M1|minimal differentiation", .) ~ "M1 / \nAML with minimal differentiation",
+    grepl("M7|megakaryo", .) ~ "M7 / \nMegakaryoblastic",
+    grepl("M6", .) ~ "M6 / \nErythroid",
+    grepl("monoblastic", .) ~ "M4 / \nMonoblastic/Monocytic",
+    grepl("Unknown", .) ~ "Unknown",
+    TRUE ~ "Other FAB"))) %>%
+
+  # filter(grepl("^M[0-9]", FAB_or_WHO.Classification)) %>%
+  group_by(CBFA2T3.GLIS2) %>%
+  mutate(N=n()) %>%
+
+  group_by(FAB, add=TRUE) %>%
+  mutate(N.FAB=n(),
+         Percent=round( (n()/N)*100, digits = 1)) %>%
+  ungroup()  %>%
+
+  mutate(Label=paste0(Percent, "%")) %>%
+  select(CBFA2T3.GLIS2,FAB,N,N.FAB,Percent, Label) %>%
+  unique()
+
+FAB
+
+# head(FAB)
+```
+
+```{r fig.height=6, fig.width=10}
+bar.FAB <- ggplot(FAB, aes(x=reorder(FAB,Percent), y=Percent, fill=CBFA2T3.GLIS2, label=Label)) +
+  geom_bar(stat="identity") +
+  geom_text(fontface="bold", size=8, nudge_y = 3) + 
+  labs(x="", title="Distribusion of FAB Groups in CBFA2T3.GLIS2") +
+  scale_fill_manual(values = "red")+
+  scale_y_continuous(limits = c(0,60), breaks=seq(0,50,by=10)) +
+  theme(legend.position = "none", 
+        plot.margin = margin(0,0,0,4, unit="mm")) +
+  theme_JS
+
+
+bar.FAB
+# ggsave("CBFGLIS_FAB_Barplot.tiff", plot=bar.FAB, device = "tiff", height = 6, width = 9, dpi=600)
+
+```
+
+```{r}
+table(grep("diff", dat.all$FAB_or_WHO.Classification, value=TRUE))
+```
+
+```{r}
+Age <- dat.all %>%
+  select(CBFA2T3.GLIS2,Age.Category) %>%
+  group_by(Age.Category) %>%
+  mutate(N=n()) %>%
+  group_by(CBFA2T3.GLIS2, add=TRUE) %>%
+  mutate(N.in.Group=n(), 
+         Percent= round((n()/N) * 100, digits = 1)) %>%
+  ungroup() %>%
+  unique() %>%
+  add_row(CBFA2T3.GLIS2=rep("Yes",3),  Age.Category=c("Between 5 and 10 years","Between 10 and 18 years","Greater than 18 years"), N=c(353,821,127), Percent=0) %>%
+  mutate_at(vars(N.in.Group),funs(ifelse(is.na(.), 0, .))) %>%
+  mutate(Percent.Labs=paste0(Percent,"%")) %>%
+  
+  mutate(Age.Category=factor(Age.Category, levels=c("Less than 3 years",
+                                                    "Between 3 and 5 years",
+                                                    "Between 5 and 10 years",
+                                                    "Between 10 and 18 years",
+                                                    "Greater than 18 years"))) %>%
+  arrange(Age.Category) 
+
+Age
+# head(Age)
+```
+
+```{r fig.height=5, fig.width=7}
+bar.Age <- ggplot(filter(Age,CBFA2T3.GLIS2=="Yes"),
+                  aes(x=Age.Category, y=Percent, fill=CBFA2T3.GLIS2)) +
+  geom_bar(stat="identity", position ="dodge") +
+  scale_y_continuous(limits = c(0,12), breaks = seq(0,10, by=2)) +
+  # geom_text(mapping=aes(x=Age.Category, y=Percent, label=Percent.Labs),
+  #           data=unique(filter(Age,CBFA2T3.GLIS2=="No")),
+  #           nudge_x = -0.225,
+  #           nudge_y = -10,
+  #           size=5.8,
+  #           color="azure",
+  #           fontface="bold",
+  #           inherit.aes = FALSE) +
+    geom_text(mapping=aes(x=Age.Category, y=Percent, label=Percent.Labs),
+            data=unique(filter(Age,CBFA2T3.GLIS2=="Yes")),
+            nudge_x = 0.1,
+            nudge_y = 2.5,
+            size=8,
+            color="black",
+            fontface="bold",
+            inherit.aes = FALSE) +
+    geom_text(mapping=aes(x=Age.Category, y=Percent, label=N.in.Group),
+            data=unique(filter(Age,CBFA2T3.GLIS2=="Yes")),
+            nudge_x = 0,
+            nudge_y = 0.6,
+            size=5,
+            color="black",
+            fontface="bold",
+            inherit.aes = FALSE) +
+  
+  scale_fill_manual(values = c("Yes"="red","No"="Navy")) +
+  labs(x="", title="Age Categories") +
+  theme_JS +
+  theme(plot.title = element_text(hjust = 0, vjust = -18, size=35),
+        legend.text = element_text(size=22),
+        legend.title = element_text(size=22),
+        legend.justification = c(1,1),
+        plot.margin = margin(l = 15, unit="mm"), 
+        legend.position = "top") +
+  guides(fill=guide_legend(title.position = "top", title.hjust = 0.5))
+
+
+
+bar.Age
+# ggsave("CBFGLIS_Age_Barplot_onlyPos.tiff", plot=bar.Age, device = "tiff", height = 5, width = 7, dpi=600)
+```
+
+
+```{r}
+Discrete.Years.Cat <- dat.all %>% 
+  select(USI=USI,CBFA2T3.GLIS2, LessThan1yr, age1yr, age2yr, age3yr) %>%
+  gather(Age.Cat,Category, -USI, -CBFA2T3.GLIS2) %>%
+  
+  group_by(Category, CBFA2T3.GLIS2) %>%
+  summarise(Number=n()) %>%
+  filter(Category != "No") %>%
+  ungroup() %>%
+  
+  group_by(Category) %>%
+  mutate(Total.In.Age.Cat=sum(Number)) %>%
+  ungroup() %>%
+  
+  group_by(CBFA2T3.GLIS2) %>%
+  mutate(Percent.In.Age.Cat=round((Number/Total.In.Age.Cat)*100, digits=1)) %>%
+  ungroup() %>%
+  
+  mutate(Percent.Labs=paste0(ifelse(!grepl("\\.", Percent.In.Age.Cat),
+                                    paste0(Percent.In.Age.Cat,".0"),
+                                    Percent.In.Age.Cat),
+                             "%")) %>%
+  mutate(Category=factor(Category, levels=c("LessThan_1yr","1yr_olds", "2yr_olds", "3yr_olds"))) %>%
+  arrange(Category) %>% 
+  add_row( Category="3yr_olds", CBFA2T3.GLIS2="Yes", Number=0, Total.In.Age.Cat=0,  Percent.In.Age.Cat=0, Percent.Labs="0.0%")
+
+
+Discrete.Years.Cat
+```
+
+
+
+```{r fig.height=5, fig.width=5}
+bar.age.2 <- ggplot(filter(Discrete.Years.Cat,CBFA2T3.GLIS2=="Yes"),
+                    aes(x=Category, y=Percent.In.Age.Cat, fill=CBFA2T3.GLIS2)) +
+  geom_bar(stat="identity", position = "dodge") +
+  scale_y_continuous(limits = c(0,14), breaks = seq(0,12, by=2)) +
+  scale_x_discrete(labels=c("< 1yr","1yr olds", "2yr olds", "3yr olds")) +
+    geom_text(mapping=aes(x=Category, y=Percent.In.Age.Cat, label=Percent.Labs),
+            data=unique(filter(Discrete.Years.Cat,CBFA2T3.GLIS2=="Yes")),
+            nudge_x = 0.1,
+            nudge_y = 1.75,
+            size=8,
+            color="black",
+            fontface="bold",
+            inherit.aes = FALSE) +
+    geom_text(mapping=aes(x=Category, y=Percent.In.Age.Cat, label=Number),
+            data=unique(filter(Discrete.Years.Cat,CBFA2T3.GLIS2=="Yes")),
+            nudge_x = 0,
+            nudge_y = 0.5,
+            size=5,
+            color="black",
+            fontface="bold",
+            inherit.aes = FALSE) +
+  
+  scale_fill_manual(values = c("Yes"="red","No"="Navy")) +
+  labs(x="", title="Age Categories",y="Percent") +
+  theme_JS +
+  theme(plot.title = element_text(hjust = 0, vjust = 1, size=20),
+        legend.text = element_text(size=22),
+        legend.title = element_text(size=22),
+        legend.justification = c(1,1),
+        plot.margin = margin(l = 5, unit="mm"),
+        legend.position = "none") 
+  # guides(fill=guide_legend(title.position = "top", title.hjust = 0.5))
+
+
+bar.age.2
+# ggsave("CBFGLIS_Age.Cat_Barplot_onlyPos.tiff", plot=bar.age.2, device = "tiff", height = 5, width = 5, dpi=600)
+```
+
+
+```{r}
+#Percent under age 5/ Percent under 10 
+dat.all %>% 
+  select(Age.Category, CBFA2T3.GLIS2) %>%
+  filter(grepl("Less than 3", Age.Category)) %>%
+  summarise(Comparison="Freq under 3 years old", 
+            Total=n(), 
+            N.Pos=nrow(filter(., CBFA2T3.GLIS2=="Yes")),
+            N.Neg=nrow(filter(., CBFA2T3.GLIS2=="No")),
+            Perc.Below3yrs=round(N.Pos/Total*100, digits = 1)) %>%
+  
+  bind_rows(., dat.all %>% 
+  select(Age.Category, CBFA2T3.GLIS2) %>%
+  filter(grepl("Between 3 and 5|Less than 3", Age.Category)) %>%
+  summarise(Comparison="Freq under 5 years old", 
+            Total=n(), 
+            N.Pos=nrow(filter(., CBFA2T3.GLIS2=="Yes")),
+            N.Neg=nrow(filter(., CBFA2T3.GLIS2=="No")),
+            Perc.Below5yrs=round(N.Pos/Total*100, digits = 1))) %>%
+  bind_rows(., dat.all %>% 
+              
+  select(Age.Category, CBFA2T3.GLIS2) %>%
+  filter(grepl("Between 3 and 5|Less than 3|Between 5 and 10", Age.Category)) %>%
+  summarise(Comparison="Freq under 10 years",
+            Total=n(), 
+            N.Pos=nrow(filter(., CBFA2T3.GLIS2=="Yes")),
+            N.Neg=nrow(filter(., CBFA2T3.GLIS2=="No")),
+            Perc.Below10yrs=round(N.Pos/Total*100, digits = 1)))
+
+
+
+TotalFreq.In.Cohort <- round(39/nrow(dat.all)*100, digits = 1) #2.02% 
+
+TotalFreq.In.Cohort
+```
+
+```{r}
+mat <- matrix(nrow=2, ncol = 2, dimnames = list(c("under3","over3"),c("pos", "neg")))
+mat[,1] <- c(38,1) 
+mat[,2] <- c(438, 1450)
+addmargins(mat)
+
+age <- chisq.test(mat)
+age
+```
+
+```{r warning=FALSE} 
+comp.all <- compareGroups(CBFA2T3.GLIS2 ~ ., 
+                           method=4, 
+                           Q1=0, Q3=1, 
+                           ref.no="No",
+                           data = dat.all[,-c(1:3)])
+```
+
+```{r}
+tab.all <- createTable(comp.all)
+
+tab.all
+```
+
+
+```{r}
+# export2word(tab.all, "TARGET_AML_0531_1031_CBFGLIS_ClinChars_Table.docx")
+# export2csv(tab.all,"TARGET_AML_0531_1031_CBFGLIS_ClinChars_Table.csv")
+```
+
+
+
+#Oncoprint 
+
+```{r}
+tile.df <- dat.all %>% 
+  
+  filter(CBFA2T3.GLIS2 == "Yes")%>%
+  select(USI,FAB_or_WHO.Classification, 
+         CBFA2T3.GLIS2,NUP98.KDM5A, NUP98.NSD1, RBM15.MKL1,
+         matches("trisomy.[1382]"), matches("^monosomy|^del"),
+         NUP98.KDM5A, NUP98.NSD1, RBM15.MKL1,
+         matches("Age.Cat|Primary.Cyto|FLT3.ITD.|CEBPA|NPM"), -trisomy.20) %>% #M7|M6
+  
+   mutate(FAB=case_when(
+    grepl("M1|minimal differentiation", FAB_or_WHO.Classification) ~ "M1/AML with minimal differentiation",
+    grepl("M7|megakaryo", FAB_or_WHO.Classification) ~ "M7/Megakaryoblastic",
+    grepl("M6", FAB_or_WHO.Classification) ~ "M6/Erythroid",
+    grepl("monoblastic", FAB_or_WHO.Classification) ~ "M4/Monoblastic/Monocytic",
+    grepl("Unknown", FAB_or_WHO.Classification) ~ "Unknown",
+    TRUE ~ "Other FAB")) %>%
+  
+  mutate(mono7_or_del7q=case_when(
+    grepl("Yes", monosomy.7) | grepl("Yes", del7q) ~ "Yes",
+    TRUE ~ "No")) %>%
+  mutate(mono5_or_del5q=case_when(
+      grepl("Yes", monosomy.5) | grepl("Yes", del5q) ~ "Yes",
+    TRUE ~ "No")) %>%
+  
+  select(-matches("^monosomy\\.|^del")) %>%
+  
+  mutate_all(funs(as.character(.))) %>%
+  mutate(Primary.Cytogenetic.Code=gsub("Unknown", "Other",
+                                       gsub("\\(|\\)", "\\.", Primary.Cytogenetic.Code))) %>%
+  mutate_at(vars(matches("CBFA|tri|NP|CE|FLT|M7|M6|NUP98|RBM15|mono")),
+                 funs(ifelse(.=="Unknown", "No", .))) %>%
+  
+  #Create numeric values to match the 
+  mutate_at(vars(matches("CBFA|tri|NP|CE|FLT|M7|M6|NUP98|RBM15|mono")),
+            funs(factor(. , levels=c("No","Yes")))) %>%
+  mutate_at(vars(matches("CBFA|tri|NP|CE|FLT|M7|M6|NUP98|RBM15|mono")),
+            funs(Num.Status=as.numeric(.))) %>%
+  
+  mutate(Num.FAB=as.numeric(as.factor(FAB)) + 4) %>%
+  mutate(Num.CytoCode=as.numeric(factor(Primary.Cytogenetic.Code,
+                                        levels=c("Normal","inv.16.","Other")))+ 9) %>%
+  # mutate(Num.AgeCat=as.numeric(factor(Age.Category, 
+  #                                     levels=c("Between 3 and 5 years","Less than 3 years" ))) + 10) %>%
+
+  gather(var,val,matches("^Num|_Num"))
+
+head(tile.df)
+# dim(tile.df)
+# sapply(select(tile.df, matches("Num")),table)
+```
+
+
+```{r}
+tile.w.perc <- tile.df %>% 
+  select(USI,var,val) %>%
+  
+  group_by(var) %>%
+  mutate(Total=sum(val)) %>%
+  ungroup() %>%
+  
+  arrange(desc(Total))
+
+CytoOrder <- unique(tile.w.perc$var)
+
+# tile.w.perc
+CytoOrder
+```
+
+```{r}
+Sample.Order <- tile.w.perc %>%
+  filter(!grepl("Primary|FAB|CBFA2T3",var)) %>% #these variable don't matter for the order of samples. Don't want to over-weight. 
+  mutate(var=factor(var,levels=CytoOrder)) %>%
+  arrange(var) %>%
+  
+  group_by(USI) %>%
+  mutate(Total_PerPatient=sum(val)) %>%
+  ungroup() %>%
+    
+  filter(!duplicated(USI)) %>% 
+  inner_join(., unique(select(tile.df, USI, Primary.Cytogenetic.Code,FAB)),
+             by="USI") %>%
+  
+  mutate(Primary.Cytogenetic.Code=factor(Primary.Cytogenetic.Code, 
+                                         levels=c("Other","Normal","inv.16."))) %>%
+  
+  mutate(FAB=factor(FAB,
+                    levels=c("M7/Megakaryoblastic",
+                             "M1/AML with minimal differentiation",
+                             "M4/Monoblastic/Monocytic",
+                             "Other FAB" ,
+                             "Unknown" ))) %>%
+  arrange(Primary.Cytogenetic.Code,desc(Total_PerPatient), FAB)#
+ 
+  
+Sample.Order
+dim(Sample.Order)
+```
+
+
+```{r}
+# tile.df$val[tile.df$Age.Category=="Less than 3 years" & tile.df$var == "Num.AgeCat"]
+# tile.df$val[tile.df$Age.Category=="Between 3 and 5 years" & tile.df$var == "Num.AgeCat"]
+
+tile.df$val[tile.df$Primary.Cytogenetic.Code=="inv.16." & tile.df$var == "Num.CytoCode"]
+tile.df$val[tile.df$Primary.Cytogenetic.Code=="Normal" & tile.df$var == "Num.CytoCode"]
+tile.df$val[tile.df$Primary.Cytogenetic.Code=="Other" & tile.df$var == "Num.CytoCode"]
+
+
+tile.df$val[tile.df$FAB=="M1/AML with minimal differentiation" & tile.df$var == "Num.FAB"]
+tile.df$val[tile.df$FAB=="M4/Monoblastic/Monocytic" & tile.df$var == "Num.FAB"]
+tile.df$val[tile.df$FAB=="M7/Megakaryoblastic" & tile.df$var == "Num.FAB"]
+tile.df$val[tile.df$FAB=="Other FAB" & tile.df$var == "Num.FAB"]
+tile.df$val[tile.df$FAB=="Unknown" & tile.df$var == "Num.FAB"]
+
+```
+
+
+
+1 == "No"
+2 == "Yes"
+
+5 == "M1"
+6 == "M4"
+7 == "M7"
+8 == "other"
+9 == "Unknown"
+
+
+10 == "Normal"
+11 == "inv.16"
+12 == "Other"
+
+
+
+
+
+```{r }
+library(tools)
+
+factor.labs <- c("1"= "Negative",
+                 "2"= "Positive",
+                 
+                 "5" = "M1/AML with minimal differentiation",
+                 "6" = "M4/Monoblastic/Monocytic",
+                 "7" = "M7/Megakaryoblastic",
+                 "8" = "Other FAB",
+                 "9" = "Unknown",
+                 
+                 "10" ="Normal Karyotype",
+                 "11"= "Inv.16*", 
+                 "12"=  "Other") 
+                 # "8" ="Between 3 and 5 years", 
+                 # "9" ="Less than 3 years")
+
+factor.cols <- c("1"="navy",
+                 "2"="red",
+                 
+                 "5" = "#66C2A5",
+                 "6" = "#FC8D62",
+                 "7" = "#8DA0CB",
+                 "8" = "#E5C494",
+                 "9"="#999999",
+                 # "5"="#F781BF",
+                 # "6"="#999999",
+
+                 "10"="#FFFF33",
+                 "11"="#984EA3",
+                 "12"="#A65628")
+labs <- gsub("Num\\.|_Num.+|\\.positive.","", rev(CytoOrder)) %>%
+  gsub("mono", "monosomy", .) %>%
+  gsub("_|\\.", " ", .) %>%
+  gsub("NPM","NPM1", .) %>%
+  # ifelse(grepl("AgeCat", .), "Age Category", .) %>%
+  ifelse(grepl("Cyto", .), "Primary Cytogenetic Code",.) %>%
+  ifelse(grepl("CBFA2T3|NUP98|RBM15", .), gsub(" ","-", .), .) %>%
+  toTitleCase(.)
+
+#  barplot(rep(1,10), col=factor.cols)
+```
+
+```{r fig.width=15, fig.height=5}
+
+
+tile.order <- tile.df %>%
+  mutate(var=factor(var, levels = rev(CytoOrder))) %>%
+  mutate(USI=factor(USI, levels = Sample.Order$USI))
+
+
+oncotile <- ggplot(tile.order, aes(x=USI, y=var, fill = factor(val))) + 
+  geom_tile(color="white", size=1.5) +
+  scale_y_discrete(labels=labs) +
+  scale_fill_manual(values = factor.cols,
+                    labels =  factor.labs) +
+  
+  labs(title="Co-occuring Cytogenetic Abnormalities in CBFA2T3-GLIS2", y="", x="") +
+  theme(axis.text.x = element_text(angle=45,hjust = 1, vjust=1, color="black", size=12),
+        axis.ticks.y = element_blank(),
+        # axis.ticks.x = element_blank(),
+        axis.text.y = element_text(size=18, color="black"),
+        plot.title = element_text(size=18, hjust=0.5),
+        legend.title = element_blank(),
+        legend.text = element_text(size=18))
+
+# tiff(file="CBFGLIS_0531_1031_Oncoprint__3.7.1.tiff", height = 7, width = 15, units = "in", res=600)
+oncotile
+# dev.off()
+
+
+```
+
+
+
+#Examine the Results from the Fusion Algorithms and Fusion Inspector
+
+```{r}
+pos.all <- CDE.all %>%
+  filter(CBFA2T3.GLIS2=="Yes") 
+
+pos.all$USI
+```
+
+```{r}
+fusions <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2018.09.11_Combine_Fusion_Calls/Combined_withConfidence_Intervals/TARGET_AML_1031_TransAbyss_STAR_TargetedAlignment_withConfidenceLevels_Combined_Annotated_10.9.18.csv")
+
+head(fusions[,1:5])
+dim(fusions)
+```
+
+```{r}
+forAGFusion <- read.delim("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2018.02.07_NCI_C.Nguyen_FusionPipeline/TARGET_AML_1031_Starfusion_inTopHapFmt_ForAGFusion.txt", sep="\t", header = FALSE)
+```
+
+
+##AGFusion
+
+```{r}
+forAGFusion <- forAGFusion %>%
+  mutate(USI=str_split_fixed(V1, "-", n=3)[,1], 
+         B=paste(V4,V7,sep="|")) %>%
+  
+  filter(USI %in% pos.all$USI) %>%
+  filter(grepl("GLIS2$|CBFA2T3$",V1) | grepl("GLIS2$|CBFA2T3$",V5)) %>%
+  
+  group_by(USI) %>%
+  filter(V8==max(V8)) %>%
+  ungroup() %>%
+
+  filter(!duplicated(B)) %>%
+  select(-USI,-B)
+
+
+length(unique(forAGFusion$V1))
+# head(forAGFusion)
+# dim(forAGFusion)
+# write.table(forAGFusion, "TARGET_AML_1031_CBFGLIS_Starfusion_inTopHapFormat_ForAGFusion.txt",
+#             sep="\t", col.names = FALSE, quote = FALSE, row.names = FALSE)
+```
+
+
+##Breakpoint Analysis
+
+```{r}
+cbfglis.fusions <- fusions %>%
+  filter(grepl("CBFA2T3-GLIS2", All_Fusions_Called)) %>%
+  filter(USI %in% pos.all$USI)  %>% #remove FP
+  select(USI,Patient,ISCN,All_Fusions_Called, matches("breakpoint|exons"))
+
+dim(cbfglis.fusions)
+# head(cbfglis.fusions)
+```
+
+
+```{r}
+cbfglis.fusions %>%
+  select(USI,Breakpoints.STAR, breakpoint.TA, Exons.TA) %>%
+  arrange(Breakpoints.STAR) %>%
+  select(-USI) %>%
+  unique()
+```
+
+```{r}
+FFPM <- read.csv("TARGET_AML_1031_0531_FusionInspector_FFPM.csv") %>%
+  filter(USI %in% intersect(pos.all$USI, cbfglis.fusions$USI)) %>%
+  filter(CBFA2T3.GLIS2=="Yes") %>%
+  filter(X.FusionName=="CBFA2T3--GLIS2") %>%
+  filter(SpliceType != "NO_JUNCTION_READS_IDENTIFIED") %>%
+  group_by(USI) %>%
+  filter(FFPM ==  max(FFPM)) %>%
+  arrange(desc(FFPM))
+
+# head(FFPM)
+length(unique(FFPM$USI))
+dim(FFPM)
+```
+
+```{r}
+round(quantile(FFPM$FFPM), digits = 1)
+quantile(FFPM$JunctionReadCount)
+quantile(FFPM$SpanningFragCount)
+table(FFPM$LargeAnchorSupport)
+```
+
+
+
+#Investigate Co-occuring Mutations 
+
+```{r}
+library(xlsx)
+```
+
+```{r}
+CBFGLIS.inMS <- readRDS("DEGs/TARGET_AML_AllCohorts_CBFGLISvsNBM_DEGs_10.23.18.RDS")
+table(CBFGLIS.inMS$cts.hd.1031$phenovector)
+pos <- names(CBFGLIS.inMS$cts.hd.1031$phenovector[CBFGLIS.inMS$cts.hd.1031$phenovector=="GroupA"])
+```
+
+```{r}
+fusions <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis/2018.09.11_Combine_Fusion_Calls/Combined_withConfidence_Intervals/TARGET_AML_0531_1031_TransAbyss_STAR_TargetedAlignment_withConfidenceLevels_Combined_Annotated_4.10.19.csv")
+
+
+# head(fusions[,1:10])
+dim(fusions)
+```
+
+```{r}
+fusions.glis2 <- fusions %>% 
+  # select(-c(4:10)) %>%
+  filter(!grepl("replicate", Patient)) %>%
+  filter(USI %in% pos)
+  # inner_join(., CDE.all, by="USI") %>%
+  # select(USI,Patient,Group,Age.Yrs, ISCN, FLT3.ITD.positive., CBFA2T3.GLIS2, everything())
+
+
+dim(fusions.glis2)
+# head(fusions.glis2)
+```
+
+```{r}
+length(unique(fusions.glis2$USI)) #36?? 
+setdiff(filter(CDE.all, CBFA2T3.GLIS2=="Yes")$USI, unique(fusions.glis2$USI))
+```
+
+```{r}
+order_fusions <- function(fusion.col){
+  
+  sapply(fusion.col, function(f){str_split(f, "-")[[1]] %>% 
+      .[order(.)] %>%
+      paste(., collapse ="-")})
+  
+}
+```
+
+
+```{r}
+sub <- fusions.glis2 %>% 
+  mutate(Reorder_Fusion=order_fusions(All_Fusions_Called)) %>% 
+  arrange(Reorder_Fusion) %>%
+  mutate_at(vars(Confidence_AllFusions), funs(paste0("Evidence_", .))) %>%
+  
+  group_by(Reorder_Fusion,Confidence_AllFusions) %>%
+  summarize(N=n()) %>% 
+  ungroup() %>% 
+  
+  spread(Confidence_AllFusions, N) %>%
+  mutate_at(vars(Evidence_1Caller_Greater10reads:Evidence_3Callers), funs(as.numeric(.))) %>%
+  mutate_at(vars(Evidence_1Caller_Greater10reads:Evidence_3Callers), funs(ifelse(is.na(.), 0, .))) %>%
+  mutate(Total_with_Fusion=rowSums(select(.,Evidence_1Caller_Greater10reads:Evidence_3Callers), na.rm = TRUE)) %>%
+
+  arrange(desc(Evidence_3Callers),
+          desc(Evidence_2Callers_Greater10reads),
+          desc(Evidence_2Callers_Greater10reads), desc(Total_with_Fusion)) %>%
+
+  select(Reorder_Fusion,Total_with_Fusion,Evidence_3Callers,contains("2Callers"), everything())
+  
+head(sub)
+dim(sub)
+```
+
+```{r}
+grep("DHH",fusions.glis2$All_Fusions_Called)
+```
+
+
+write.xlsx(data.frame(filter(sub, Type=="interchromosomal")),sheetName = "interchromosomal_Fusion_Tally",file = "TARGET_AML_1031_CBFGLIS_Co-Occuring_Fusions_by_RNAseq.xlsx", row.names = FALSE)
+write.xlsx(data.frame(filter(sub, Type=="intrachromosomal")),sheetName = "intrachromosomal_Fusion_Tally",file = "TARGET_AML_1031_CBFGLIS_Co-Occuring_Fusions_by_RNAseq.xlsx", append = TRUE, row.names = FALSE)
+write.xlsx(fusions.glis2,sheetName = "fusions_master_file",file = "TARGET_AML_1031_CBFGLIS_Co-Occuring_Fusions_by_RNAseq.xlsx", append = TRUE, row.names = FALSE)
+
+
+
+
+#Statistics for the Cytotoxicity Assays 
+
+```{r}
+cd56 <- c( 2860, 2855, 2454)/4334
+
+lymph <- c(558, 538,  534)/581.3333
+
+
+wilcox.test(x=cd56, y=lymph, alternative = "less")
+t.test(x=cd56, y=lymph, paired = TRUE, alternative = "less")
+```
+
+
+```{r}
+AML610 <- read.csv("Notable_Labs/RawData_Notabe_610AML_Cytotox.csv") #replicate 1 in manuscript
+
+head(AML610)
+
+AML650 <- read.csv("Notable_Labs/RawData_Notable_650AML2_Cytotox.csv") #replicate 2 in manuscript
+head(AML650)
+```
+
+```{r}
+table(AML610$Condition)
+```
+
+```{r}
+ttest.AML610 <- AML610 %>% 
+  filter(!grepl("Staur", Condition)) %>%
+  gather(Cell_Type, Cell_count,X56..Cells, Lymphoid) %>%
+  group_by(Cell_Type,Condition) %>%
+  mutate(Average=mean(Cell_count))  %>%
+  ungroup() %>% 
+  
+  group_by(Cell_Type) %>%
+  mutate(Norm=Cell_count/filter(., Condition == ))
+
+
+  
+  # mutate(Norm.56Cells = X56..Cells/sum())
+  # do(t.test=t.test(x=.$X56..Cells, y=.$Lymphoid, paired = TRUE, alternative = "less"))
+
+ttest.AML610
+# names(ttest.AML610$t.test) <- ttest.AML610$Condition
+```
+
+
+```{r}
+ttest.AML610$t.test
+```
+
+

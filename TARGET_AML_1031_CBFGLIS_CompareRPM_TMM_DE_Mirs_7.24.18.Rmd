@@ -1,0 +1,428 @@
+---
+title: 'Comparison of DE Mirs Workflows'
+author: "Jenny Smith"
+date: "July 25, 2018"
+output: html_document
+---
+
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.width = 10, fig.height = 10)
+knitr::opts_knit$set(root.dir = '~/RNA_seq_Analysis/2018.03.21_CBF-GLIS_DEGs_Comprehensive/')
+options(stringsAsFactors = FALSE)
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+getwd()
+```
+
+
+```{r}
+source("~/scripts/miRNAseq_analysis/DifferentialExpression_miRNAseq_pipeline_07.24.18.r")
+source("~/scripts/miRNAseq_analysis/calcWilcoxTest.R")
+```
+
+
+
+Ultimately, though RPM was very intriguing in its results from the RPM normalized data, literature states that RPM introduces more variance and bias than the TMM method. Though there are some competing views on TMM, it performed as well as DESEq2 median ratio normalized. Will continue to use TMM method. 
+
+Also TMM method performed well when using libraries of highly varied size, and compared to qPCR quanitification of the DEMirs identified. 
+
+
+*Optimization of miRNA-seq data preprocessing*
+Shirley Tam,  Ming-Sound Tsao,  John D. McPherson
+Briefings in Bioinformatics, Volume 16, Issue 6, 1 November 2015, Pages 950–963, https://doi.org/10.1093/bib/bbv019
+
+
+*Genome-wide analysis of thapsigargin-induced microRNAs and their targets in NIH3T3 cells*
+Jody Groenendyk,a Xiao Fan,b Zhenling Peng,b Yaroslav Ilnytskyy,c Lukasz Kurgan,b and Marek Michalaka,⁎
+Genom Data. 2014 Dec; 2: 325–327.
+Published online 2014 Oct 7. doi:  10.1016/j.gdata.2014.10.002
+
+
+#Read in the clinical Data
+
+```{r}
+CDE.1031 <- read.csv("~/reference_mapping-files/TARGET_AML_1031_CDE_cleaned_7.06.2018.csv", 
+                     stringsAsFactors = FALSE)
+
+CDE.1031 <- CDE.1031 %>%
+  filter(!is.na(USI)) %>%
+  set_rownames(.$USI)
+
+head(CDE.1031[,1:5])
+# dim(CDE.1031) #1149  142
+```
+
+```{r}
+table(CDE.1031$CBFA2T3.GLIS2_RNASeqCalls) #from qPCR /RNA seq results 
+# table(CDE.1031$CBFA2T3.GLIS2_RNASeqCalls) #3 with only RNA-seq calls, but appear validated by Fusion Inspector
+```
+ 
+ 
+```{r}
+merged <- read.csv("~/reference_mapping-files/TARGET_AML_1031_0531_Merged_CDE_07.12.18.csv", 
+                   stringsAsFactors = FALSE)
+
+merged <- merged %>% 
+  filter(!is.na(USI)) %>%
+  select(USI, CBFA2T3.GLIS2=CBFA2T3.GLIS2_RNASeqCalls,everything()) %>%
+  set_rownames(.$USI)
+
+head(merged[,1:5])
+```
+ 
+```{r}
+table(merged$CBFA2T3.GLIS2) #25
+```
+
+
+#Read in the miRNAseq Expression Sets
+
+NOTE: 0531 only has RPMs available. 
+
+```{r}
+# RPM.0531 <- read.csv("2017.02.15_CBF-GLIS_DEG/ExpressionData/TARGET_AML_0531_MIMAT_miRNAseq_RPM.csv", 
+#                      stringsAsFactors = FALSE, row.names = 1)
+# 
+# head(RPM.0531[,1:5])
+```
+
+
+```{r}
+# DX.RPM <- RPM.0531 %>%
+#   select_if(grepl("miR|MIMAT|^[BR].[0-9]{4,5}", colnames(.)) | (grepl("TARGET.20", colnames(.)) & grepl("03A|09A", colnames(.)))) %>%
+#   set_colnames(gsub("^.+([A-Z]{6})\\.0[39]A.+", "\\1",colnames(.)))
+# 
+# head(DX.RPM[,1:5])
+# # dim(DX.RPM) #2715  640
+```
+
+
+```{r}
+# write.csv(DX.RPM,
+          # "TARGET_AML_0531_miRNAseq_DXandNBM_Samples_RPM.csv")
+```
+
+
+```{r}
+RPM.1031 <- read.csv("~/miRNAseq_Analysis/2017July_BCCA_1031_Illumina_data/TARGET_AML_AAML1031_expn_matrix_mimat_miRNA_RPM.csv",
+                     stringsAsFactors = FALSE, row.names = 1) 
+
+head(RPM.1031[,1:5])
+```
+
+
+```{r}
+mir.cts.1031 <- read.csv("~/miRNAseq_Analysis/2017July_BCCA_1031_Illumina_data/TARGET_AML_AAML1031_expn_matrix_mimat_miRNA_rawCounts.csv",
+                     stringsAsFactors = FALSE, row.names = 1) 
+
+head(mir.cts.1031[,1:5])
+```
+
+
+#Reformat the counts
+
+```{r}
+reformat.mirs <- function(df){  
+  df <- df %>%
+    rownames_to_column("MIMAT") %>%
+    select(which(!grepl("BCCA", colnames(.)))) %>%
+    set_colnames(str_split_fixed(colnames(.), "\\.", n=2)[,1])  %>%
+    set_rownames(.$MIMAT) %>%
+    select(-MIMAT)
+}
+```
+
+```{r}
+RPM.1031 <- reformat.mirs(RPM.1031)
+
+head(RPM.1031[,1:5])
+# dim(RPM.1031) # 2576 1135
+```
+
+```{r}
+sums <- colSums(RPM.1031)
+head(sums)
+```
+
+```{r}
+mir.cts.1031 <- reformat.mirs(mir.cts.1031)
+
+head(mir.cts.1031[,1:5])
+# dim(mir.cts.1031) #2576 by 1135
+```
+
+
+```{r}
+# write.csv(RPM.1031, "~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/TARGET_AML_AAML1031_MIMAT_mirbasev20_DXandNBM_Samples_RPM.csv", row.names = FALSE)
+```
+
+
+#Differential miRNAs Analysis 
+
+##AML
+
+```{r}
+pos.all <- merged[merged$CBFA2T3.GLIS2 == "Yes", "USI"]
+neg.all <- merged[merged$CBFA2T3.GLIS2 == "No", "USI"]
+
+
+pos.1031 <- intersect(colnames(mir.cts.1031), pos.all) #25 between 1031 and a handful of  0531
+neg.1031 <- intersect(colnames(mir.cts.1031), neg.all) #1024 1031 negatives
+
+```
+
+```{r}
+# tiff("TARGET_AML_1031_CBGLIS_vs_OtherAML_DEMirs_Heatmap.tiff", width = 10, height = 10, units="in", res=600)
+
+DEMirs <- twoGroups_DEMirs(expnData = mir.cts.1031, 
+                           clinData = merged, 
+                           col = "CBFA2T3.GLIS2", 
+                           ref = "No",
+                           RPM = FALSE,
+                           BM = FALSE)
+# dev.off()
+
+# save(DEMirs, file="TARGET_AML_1031_CBFGLIS_vs_OtherAML_DEMirs.RData")
+# table(DEMirs$phenovector)
+```
+
+```{r}
+# summary(DEMirs)
+dim(DEMirs$DE$Voom$E) #596 mirs considered expressed. 
+```
+
+
+```{r}
+DEMirs.df <- extract_DEMirs(DEMirs)
+
+head(DEMirs.df)  #119 identified 
+
+range(DEMirs.df$logFC)
+range(DEMirs.df$AveExpr)
+# write.csv(DEMirs.df, "TARGET_AML_1031_CBFGLIS_vs_OtherAML_DEMirs.csv", row.names = FALSE)
+```
+
+
+```{r}
+# tiff("TARGET_AML_1031_CBGLIS_vs_OtherAML_DEMirs_RPM_Heatmap.tiff", width = 10, height = 10, units="in", res=600)
+DEMirs.RPM <- twoGroups_DEMirs(expnData = RPM.1031, 
+                           clinData = merged, 
+                           col = "CBFA2T3.GLIS2", 
+                           ref = "No",
+                           RPM = TRUE,
+                           BM = FALSE)
+# dev.off()
+```
+
+```{r}
+table(DEMirs.RPM$phenovector)
+```
+
+```{r}
+DEMirs.RPM.df <- extract_DEMirs(DEMirs.RPM)
+
+head(DEMirs.RPM.df)
+
+# write.csv(DEMirs.RPM.df, "TARGET_AML_1031_CBFGLIS_vs_OtherAML_DEMirs.csv", row.names = FALSE)
+range(DEMirs.RPM.df$logFC)
+range(DEMirs.RPM.df$AveExpr)
+```
+
+The AveExpr column gives the average log2-expression level for that gene across all the arrays
+and channels in the experiment.
+
+
+```{r}
+RPM.filt <- RPM.1031[,c(pos.1031, neg.1031)]
+
+
+AML <- ! grepl("^BM|^RO", colnames(RPM.filt))
+AMLsamples <- sum(AML)
+idx <- rowSums(RPM.filt >= 1) >= max(2,(0.03*AMLsamples))
+
+
+DEMirs.Wilx <- calcWilcoxTest(df=RPM.filt[idx,], 
+                              libsA = pos.1031, libsB = neg.1031, 
+                              aname = "CBFGLIS", bname = "OtherAML", 
+                              log = T, paired = F, dcores = F)
+
+head(DEMirs.Wilx)
+```
+
+```{r}
+DEMirs.Wilx.df <- DEMirs.Wilx %>%
+  rownames_to_column("MIMAT") %>%
+  filter(adj_p_val < 0.05 & abs(log2_fold_change_CBFGLIS..OtherAML) > 1) %>%
+  arrange(desc(log2_fold_change_CBFGLIS..OtherAML))
+
+head(DEMirs.Wilx.df)
+range(DEMirs.Wilx.df$log2_fold_change_CBFGLIS..OtherAML)
+range(DEMirs.Wilx.df$log2_base_mean)
+```
+
+
+#Compare results 
+
+```{r}
+length(intersect(DEMirs.RPM.df$gene, DEMirs.df$gene)) #95 in common using limma with RPM or raw counts
+```
+
+```{r}
+length(intersect(DEMirs.RPM.df$gene, DEMirs.Wilx.df$MIMAT))  #105 out of 108 DEmirs in common using 
+```
+
+```{r}
+length(intersect(DEMirs.Wilx.df$MIMAT, DEMirs.df$gene)) #96 in common with 
+```
+
+
+```{r}
+t <- setdiff(DEMirs.RPM.df$gene, DEMirs.df$gene)
+t2 <- setdiff(t, rownames(DEMirs$DE$Voom$E)) #those are filtered off for not having at least 5 raw counts in at least 32 samples, but have 1RPM in at least 31 samples??
+```
+
+Yes they were filtered out using the raw counts filter. But this cannot be changed all the time... They are just under the cutoff of 3% of pop. 
+```{r}
+missingMirs <- c("hsa-mir-876.MIMAT0004924", "hsa-mir-876.MIMAT0004925", "hsa-mir-873.MIMAT0004953", "hsa-mir-873.MIMAT0022717")
+
+test <- mir.cts.1031[missingMirs, c(pos.1031, neg.1031)] >= 5 
+
+head(test[,1:5])
+
+apply(test, 1, sum)
+```
+
+
+```{r}
+ggbox_dot_plots <- function(grouped.df,title){
+  
+  title <- unique(title)
+
+ p <-  ggplot(grouped.df, aes(x=group, y=val, fill=group, color=group)) +
+  labs(y="", title=title) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter() +
+  scale_color_manual(values=c("GroupA"="red", "GroupB"="navy")) +
+  theme_bw()
+ 
+ return(p)
+}
+```
+
+
+```{r fig.width=5, fig.height=5}
+missingMirs.RPM <- DEMirs.RPM$DE$Log2 %>%
+  as.data.frame() %>%
+  rownames_to_column("MIMAT") %>% 
+  filter(MIMAT %in% t) %>%
+  gather(var,val, -MIMAT) %>%
+  inner_join(., data.frame(group=DEMirs.RPM$phenovector, USI=names(DEMirs.RPM$phenovector)), by=c("var"="USI")) %>%
+  group_by(MIMAT) %>%
+  do(plots=ggbox_dot_plots(., title=unique(.$MIMAT)))
+  # filter(MIMAT=="hsa-mir-873.MIMAT0004953")
+  
+# missingMirs.RPM  
+
+missingMirs.RPM$plots
+  
+```
+
+
+```{r fig.width=5, fig.height=5}
+missingMIRs <- DEMirs$DE$Voom$E[intersect(t, rownames(DEMirs$DE$Voom$E)),] %>%
+  as.data.frame() %>%
+  rownames_to_column("MIMAT") %>%
+  gather(var,val, -MIMAT) %>%
+  inner_join(., as.data.frame(DEMirs$DE$Voom$targets) %>% rownames_to_column("USI"), by=c("var"="USI")) %>%
+  group_by(MIMAT) %>%
+  do(plots=ggbox_dot_plots(., title = .$MIMAT))
+
+
+missingMIRs$plots
+```
+
+
+```{r}
+# DEMirs.df %>%
+  # filter(gene %in% setdiff(DEMirs.df$gene,DEMirs.RPM.df$gene))
+```
+
+
+##NBM
+
+```{r}
+# tiff("TARGET_AML_1031_CBGLIS_vs_NBM_DEMirs_Heatmap.tiff", width = 10, height = 10, units="in", res=600)
+
+DEMirs.NBM <- twoGroups_DEMirs(expnData = mir.cts.1031, 
+                           clinData = merged, 
+                           col = "CBFA2T3.GLIS2", 
+                           ref = "No",
+                           RPM = FALSE,
+                           BM = TRUE)
+# dev.off()
+
+# save(DEMirs.NBM, file="TARGET_AML_1031_CBFGLIS_vs_NBM_DEMirs.RData")
+
+table(DEMirs.NBM$phenovector)
+```
+
+
+
+```{r}
+dim(DEMirs.NBM$DE$Voom$E) #516 mirs considered expressed. 
+```
+
+
+```{r}
+DEMirs.NBM.df <- extract_DEMirs(DEMirs.NBM)
+
+head(DEMirs.NBM.df) #224 
+
+# write.csv(DEMirs.NBM.df, "TARGET_AML_1031_CBFGLIS_vs_NBM_DEMirs.csv",row.names = FALSE)
+```
+
+
+```{r}
+# DEMirs.NBM$MDS$plot #need to fix 
+```
+
+
+```{r}
+# tiff("TARGET_AML_1031_CBGLIS_vs_NBM_DEMirs_RPM_Heatmap.tiff", width = 10, height = 10, units="in", res=600)
+
+DEMirs.NBM.RPM <- twoGroups_DEMirs(expnData = RPM.1031, 
+                           clinData = merged, 
+                           col = "CBFA2T3.GLIS2", 
+                           ref = "No",
+                           RPM = TRUE,
+                           BM = TRUE)
+# dev.off()
+```
+
+```{r}
+table(DEMirs.NBM.RPM$phenovector)
+```
+
+```{r}
+# DEMirs.NBM.RPM
+```
+
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+

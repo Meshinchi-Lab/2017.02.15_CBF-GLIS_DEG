@@ -1,0 +1,850 @@
+---
+title: "RNAseq Analysis of CBFA2T3-GLIS2 Transduced Cord Blood"
+author: "Jenny Smith"
+date: "12/28/20"
+output: html_document
+---
+
+
+# Set-up 
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2017.02.15_CBF-GLIS_DEG/2021.07.21_CutnTag"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+node=Sys.info()[["nodename"]]
+if(!grepl("local", node)){
+  print(node)
+  options(bitmapType = 'cairo')
+  grDevices::X11.options(type='cairo')
+}
+
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+
+library(ggplot2)
+library(gridExtra)
+library(ggpubr)
+library(ggrepel)
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+
+library(DeGSEA)
+library(edgeR)
+library(fusBreakpoint)
+
+getwd()
+```
+
+```{r}
+#hrbrthemes
+# devtools::install_github("thomasp85/patchwork")
+library(patchwork)
+```
+
+
+#Define Functions 
+
+# ClinData
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_05.21.21.csv"),
+                   na.strings = c("#N/A", "NA", ".",""))
+
+merged <- merged %>% 
+  dplyr::filter(!grepl("Unknown", USI)) %>%
+  dplyr::filter(Eligibility_Comments != "remove")
+
+
+dim(merged) #2217  150
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET,
+                                    "SequencingDataMatrix/00_archive/TARGET_AML_Ribodepleted_Manifest_06.09.21.csv")) 
+
+dim(sample_info)
+table(sample_info$Batch)
+```
+
+# Raw Counts
+
+```{r eval=FALSE}
+cts <- readRDS("../2020.12.23_CBFGLIS_Models/Expression_Data/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Models_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS")
+colnames(cts)[grep("PATGIG|PATISD", colnames(cts))] <- gsub("_replicate", "", grep("PATGIG|PATISD", colnames(cts), value=T))
+
+geneIDs <- cts[,1:2]
+rownames(cts) <- cts$gene_name
+cts <- cts[,-c(1:2)]
+
+
+dim(cts)
+head(cts[,1:5]) 
+```
+
+```{r eval=FALSE}
+TPM <- readRDS(file.path(PROJHOME, "2017.02.15_CBF-GLIS_DEG/2020.12.23_CBFGLIS_Models/Expression_Data/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Models_Kallisto_Quant_GeneLevel_Abundance_TPM.RDS"))
+colnames(TPM)[grep("PATGIG|PATISD", colnames(TPM))] <- gsub("_replicate", "", grep("PATGIG|PATISD", colnames(TPM), value=T))
+
+
+geneIDs.tpm <- TPM[,1:2]
+rownames(TPM) <- TPM$gene_name
+TPM <- TPM[,-c(1:2)]
+
+
+dim(TPM)
+head(TPM[,1:5])
+```
+
+```{r}
+counts <- readRDS(file.path(PROJHOME, "2017.02.15_CBF-GLIS_DEG/2020.12.23_CBFGLIS_Models/Expression_Data/TARGET_AML_RBD_Dx_Rlps_NBM_MPN_Models_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
+colnames(TPM)[grep("PATGIG|PATISD", colnames(TPM))] <- gsub("_replicate", "", grep("PATGIG|PATISD", colnames(TPM), value=T))
+
+
+geneIDs.counts<- counts[,1:2]
+rownames(counts) <- counts$gene_name
+counts <- counts[,-c(1:2)]
+
+
+dim(counts)
+head(counts[,1:5])
+```
+
+
+
+# Gene Annotations
+
+```{r}
+geneIDmap <- read.delim(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno_5.14.21.txt")) %>% 
+  filter(gene_id %in% geneIDs$gene_id)
+
+dim(geneIDmap) #58263    23
+# View(geneIDmap)
+```
+
+```{r}
+CBFGLISvsAML <- read.csv(file.path(PROJHOME,"0000.00.05_DEG_Lists/GRCh38_hg38/Kallisto/CBFA2T3GLIS2vsOthers_DEGs.csv"))
+
+dim(CBFGLISvsAML)
+head(CBFGLISvsAML, n=10)
+```
+
+```{r}
+CBFGLISvsNBM <- read.csv(file.path(PROJHOME, "0000.00.05_DEG_Lists/GRCh38_hg38/Kallisto/CBFA2T3GLIS2vsNBM_DEGs.csv"))
+
+dim(CBFGLISvsNBM)
+head(CBFGLISvsNBM, n=10)
+```
+
+```{r}
+# table(DEGs.EC$Week6$phenovector)
+DEGs.EC.week7 <- read.csv("../2020.12.23_CBFGLIS_Models/DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_Week7_EC.culture_DEGs_5.21.21.csv", 
+                          comment.char = "#")
+head(DEGs.EC.week7)
+tail(DEGs.EC.week7)
+dim(DEGs.EC.week7) #4076    9
+```
+
+```{r}
+DEGs.EC.week12 <- read.csv("../2020.12.23_CBFGLIS_Models/DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_Week12_EC.culture_DEGs_5.21.21.csv",
+                           comment.char = "#")
+# DEGs.EC.week12 <- extract_DEGs(DEGs.EC$Week12) %>% 
+#   left_join(., ids2symbols, by=c("gene"="gene_name"))
+  # filter(grepl("^ENSG", gene_id))
+
+head(DEGs.EC.week12)
+dim(DEGs.EC.week12) #4083    9
+```
+
+```{r}
+DEGs.MC.week7  <- read.csv("../2020.12.23_CBFGLIS_Models/DEGs/TARGET_AML_CBFGLIS.model_vs_GFP_Week7_MC.culture_DEGs_5.21.21.csv", comment.char = "#")
+
+head(DEGs.MC.week7)
+dim(DEGs.MC.week7) #3797    8
+```
+
+
+```{r}
+union <- CBFGLISvsAML %>% 
+  select(gene_name, logFC, adj.P.Val) %>% 
+  rename_at(vars(logFC:adj.P.Val), ~paste0(.,"_CBFGLIS_patients_vs_otherAML")) %>% 
+  full_join(., select(CBFGLISvsNBM,
+                       gene_name, logFC, adj.P.Val) %>%
+               rename_at(vars(logFC:adj.P.Val), ~paste0(.,"_CBFGLIS_patients_vs_NBM")),
+             by="gene_name") %>%
+  full_join(., select(DEGs.EC.week7,
+                       gene, logFC, adj.P.Val) %>%
+               rename_at(vars(logFC:adj.P.Val), ~paste0(.,"_CBFGLIS.CB_week6_vs_GFP")),
+             by=c("gene_name"="gene")) %>%
+  full_join(., select(DEGs.EC.week12,
+                       gene, logFC, adj.P.Val) %>%
+               rename_at(vars(logFC:adj.P.Val), ~paste0(.,"_CBFGLIS.CB_week12_vs_GFP")),
+             by=c("gene_name"="gene")) %>% 
+  left_join(., select(geneIDmap,gene_name, gene_id), by="gene_name") %>% 
+  select(gene_name, gene_id, everything())
+
+
+
+# head(union)
+# tail(union)
+
+dim(union)  # 21249    10
+```
+
+# DepMap CRISPR Data
+
+Metadata for all of DepMap’s cancer models/cell lines. A full description of each column is available in the DepMap Release README file. - DepMap_ID: Static primary key assigned by DepMap to each cell line - stripped_cell_line_name: Cell line name with alphanumeric characters only - CCLE_Name: Previous naming system that used the stripped cell line name followed by the lineage; no longer assigned to new cell lines - alias: Additional cell line identifiers (not a comprehensive list) - COSMIC_ID: Cell line ID used in Cosmic cancer database - lineage, lineage_subtype, lineage_sub_subtype, lineage_molecular_subtype: Cancer type classifications in a standardized form - sex: Sex of tissue donor if known - source: Source of cell line vial used by DepMap - RRID: Cellosaurus research resource identifier - sample_collection_site: Tissue collection site - primary_or_metastasis: Indicates whether tissue sample is from primary or metastatic site - disease: General cancer lineage category - disease_subtype: Subtype of disease; specific disease name - age: If known, age of tissue donor at time of sample collection - Sanger_model_ID: Sanger Institute Cell Model Passport ID - additional_info: Further information about cell line modifications and drug resistance
+
+```{r}
+depmap_samples <- read.csv("DepMap/sample_info.csv")
+
+head(depmap_samples)
+```
+
+
+CRISPR_gene_dependency (1)
+Gene Dependency Probabilities represent the likelihood that knocking out the gene has a cell growth inhibition or death effect. These probabilities are derived from the scores in CRISPR_gene_effect.csv as described here: https://doi.org/10.1101/720243 - Columns: genes in the format "HUGO (Entrez)" - Rows: cell lines (Broad IDs)
+
+version DepMap Public 22Q1
+
+```{r}
+depmap <- read.csv("DepMap/CRISPR_gene_dependency.csv", check.names = FALSE)
+
+dep_map_ids <- data.frame(Colnames=colnames(depmap)) %>% 
+  separate(Colnames, into=c("gene_name","entrez_id"), sep=" ", remove=FALSE) %>% 
+  mutate_at(vars(entrez_id), ~gsub("\\(|\\)","", .)) %>% 
+  mutate(duplicates=duplicated(gene_name) | duplicated(gene_name, fromLast = T))
+
+# table(dep_map_ids$duplicates) #OK
+
+colnames(depmap) <- dep_map_ids$gene_name
+head(depmap[,1:5])
+dim(depmap) #1070 17387
+```
+
+
+Gene Effect scores derived from CRISPR knockout screens published by Broad’s Achilles and Sanger’s SCORE projects. Negative scores imply cell growth inhibition and/or death following gene knockout. Scores are normalized such that nonessential genes have a median score of 0 and independently identified common essentials have a median score of -1. Gene Effect scores were inferenced by Chronos. View full the full Chronos publication here: https://genomebiology.biomedcentral.com/articles/10.1186/s13059-021-02540-7 Integration of the Broad and Sanger datasets was performed as described here: https://doi.org/10.1038/s41467-021-21898-7) except that quantile normalization was not performed.
+
+```{r}
+depmap_scores <- read.csv("DepMap/CRISPR_gene_effect.csv", check.names = FALSE)
+
+dep_map_ids_2 <- data.frame(Colnames=colnames(depmap_scores)) %>% 
+  separate(Colnames, into=c("gene_name","entrez_id"), sep=" ", remove=FALSE) %>% 
+  mutate_at(vars(entrez_id), ~gsub("\\(|\\)","", .)) %>% 
+  mutate(duplicates=duplicated(gene_name) | duplicated(gene_name, fromLast = T))
+
+# table(dep_map_ids_2$duplicates)
+colnames(depmap_scores) <- dep_map_ids_2$gene_name
+head(depmap_scores[,1:5])
+```
+
+
+# Define Samples and Contrasts 
+
+```{r}
+CBFGLIS.models <- read.csv("TARGET_AML_CBFGLIS_CordBlood_Models_Sample_Conditions.csv")
+
+# head(CBFGLIS.models)
+dim(CBFGLIS.models) #50 56
+# View(CBFGLIS.models)Ω
+```
+
+```{r}
+CBFGLIS.cutntag.samples <- read.delim("TARGET_AML_CBFGLIS.models_CutNTag_Run1_Sample_Manifest.txt", sep="\t", header = FALSE) %>% 
+  rename_all(~c("Sample_ID", "Date", "Condition", "Antibody")) %>% 
+  arrange(Condition, Antibody)
+
+head(CBFGLIS.cutntag.samples)
+# View(CBFGLIS.cutntag.samples)
+```
+
+```{r}
+CBFGLIS_samples <- CBFGLIS.models %>%  
+  filter(grepl("CordBlood", AML_Subtype), !grepl("sort", Sample)) %>%
+  mutate_at(vars(Time_Point_Group), ~case_when(
+    .=="Week7" ~ gsub("7", "6", .),
+    TRUE ~ .)) %>% 
+  bind_rows(., filter(sample_info, grepl("CD34|NBM|GLIS2",AML_Subtype),
+                      grepl("diagnostic|NBM|CD34", Time_point))) %>%
+  left_join(.,dplyr::select(merged, USI, M7_AML,
+                     BM.blasts=Bone.marrow.leukemic.blast.percentage....),
+            by="USI") %>%
+  mutate_at(vars(c("Time_point","Time_Point_Group","Culture_condition",
+                   "Transduction_condition","M7_AML")),
+            ~case_when(
+              is.na(.) ~ AML_Subtype,
+              TRUE ~ .)) %>%
+  
+  mutate(Comparisons=paste(Culture_condition, Time_Point_Group, AML_Subtype, sep="_")) %>%
+  mutate(Comparisons=gsub("^(CBFA2T3.GLIS2|NBM|CD34_PB)_.+", "\\1", Comparisons)) %>% 
+  
+  mutate(USI1=USI,
+         USI=Sample) %>% 
+  arrange(AML_Subtype) %>% 
+  set_rownames(.$Sample)
+
+
+
+dim(CBFGLIS_samples) #182  64
+table(CBFGLIS_samples$Comparisons)
+# colnames(CBFGLIS_samples)[colnames(CBFGLIS_samples) %in% colnames(sample_info)]
+```
+
+
+```{r}
+samps_all <- sample_info %>% 
+  filter(grepl("^AML|CD34_PB|NBM|Normal_PB|^FlowSorted", Group))  %>% 
+  mutate_at(vars(Time_point), ~case_when(
+    Group=="FlowSorted" & grepl("Unsorted.0[39]A",Sample) ~ "diagnostic",
+    TRUE ~ .)) %>% 
+  mutate_at(vars(Sample), ~case_when(
+    grepl("PATGIG|PATISD", .) ~ gsub("_replicate", "", .),
+    TRUE ~ .)) %>% 
+  filter(grepl("diagnostic|CD34_PB|NBM|Normal_PB", Time_point)) %>% 
+  
+  #Keep only the CBFGLIS samples of interest from EC and Myeloid cultures
+  bind_rows(., filter(CBFGLIS_samples, grepl("^EC|^Myeloid", Comparisons), 
+                      !grepl("Myeloid_Week12|EC_Week9|Myeloid_Week6_GFP_CordBlood", Comparisons),
+                      !grepl("mock", Sample))) %>% 
+  mutate_at(vars(Time_Point_Group), ~case_when(
+    is.na(.) ~ Time_point,
+    TRUE ~ .)) %>% 
+  filter(!grepl("_replicate", Sample)) %>% 
+  filter(Sample %in% colnames(TPM)) %>% 
+  set_rownames(.$Sample)
+  
+
+
+dim(samps_all)
+table(samps_all$Group)
+table(samps_all$Time_Point_Group)
+table(samps_all$Comparisons)
+
+
+# table(CBFGLIS_samples$Sample  %in% samps_all$Sample)
+```
+
+
+# Run Motif Analysis 
+
+```{r}
+# library(rtracklayer)
+# View(CBFGLIS.cutntag.samples)
+```
+
+```{r}
+cutnrun_data <- dir("SEACR", pattern = ".stringent.bed", full.names = TRUE) %>% 
+  data.frame(File=.) 
+
+dim(cutnrun_data)
+# grep("JFS1740|JFS1749|JFS1741|JFS1750", cutnrun_data$File, value=TRUE) #why only two CBFA2T3 and GLIS2 antibody samples are included, when there are replicates?
+
+# write.table(cutnrun_data, "CBFGLIS.models_CutnTag_Sample_Sheet.txt", col.names =FALSE, row.names = FALSE, quote = FALSE)
+```
+
+So the BED files output from SEACR to call peak enrichment does not include strand information. HOMER requires strand information which makes sense, however, HOMER appears to run regardless of the strand information? so now I need to figure out what  MOTIFs exactly is the algorithm looking for. 
+
+## Run for each file/condition individually 
+
+```{bash eval=FALSE}
+sbatch ~/scripts/sbatch_jobs/Homer_Motif_Analysis.sh CBFGLIS.models_CutnTag_Sample_Sheet.txt 
+```
+
+## Use custom background with the controls 
+
+```{r}
+table(CBFGLIS.cutntag.samples$Condition)
+```
+
+```{r}
+controls <- CBFGLIS.cutntag.samples %>% 
+  filter(grepl("GFP|E4", Condition),
+         grepl("CBF|Glis", Antibody))
+
+controls
+
+#Need to run SEACR on the controls to do this. It hasnt been done yet. 
+# cutnrun_data %>%
+#   filter(grepl(paste(controls$Sample_ID, collapse="|"), File))
+```
+
+```{bash eval=FALSE}
+#https://bedops.readthedocs.io/en/latest/content/reference/set-operations/bedops.html
+ml BEDOPS/2.4.35-foss-2018b
+bedops -u JFS1764 JFS1765 JFS1758 JFS1759
+```
+
+
+# Intersect the CBFA2T3 and GLIS2 peaks and condition
+
+```{bash eval=FALSE}
+ml Homer/4.11-Perl-5.30.0
+ 
+mergePeaks -d 100 "SEACR/JFS1740.stringent.bed" "SEACR/JFS1741.stringent.bed" -prefix "CBFGLIS_CD34_CB"
+
+mergePeaks -d given "SEACR/JFS1740.stringent.bed" "SEACR/JFS1741.stringent.bed" -prefix "CBFGLIS_CD34_CB_given"
+```
+
+```{r}
+# common_peaks <- rtracklayer::import.bed("MergePeaks/CBFGLIS_CD34_CB_SEACR_JFS1740.stringent.bed_SEACR_JFS1741.stringent.bed")
+common_peaks <- read.table("MergePeaks/distance_given/CBFGLIS_CD34_CB_given_SEACR_JFS1740.stringent.bed_SEACR_JFS1741.stringent.bed", sep="\t")
+
+head(common_peaks)
+dim(common_peaks) #1764   10
+# table(common_peaks$V5) #it set all to + strand but this is arbitrary due to the fact that peaks from SEACR have no strand. 
+```
+
+```{r}
+common_peaks_bed <- common_peaks %>% 
+  select(V2:V4, V1,V6,V5)  %>% 
+  mutate(V5="XXX")
+
+
+head(common_peaks_bed)
+# write.table(common_peaks_bed,
+#             file = "MergePeaks/distance_given/CBFGLIS_CD34_CB_SEACR_common_CBFA2T3_and_GLIS2_antibody_dgiven.bed",
+#             sep="\t",
+#             quote = FALSE,
+#             col.names = FALSE,
+#             row.names = FALSE)
+```
+
+```{bash eval=FALSE}
+SCRATCH="/fh/scratch/delete90/meshinchi_s/jlsmith3"
+file="CBFGLIS_CD34_CB_SEACR_common_CBFA2T3_and_GLIS2_antibody_dgiven.bed"
+
+findMotifsGenome.pl $file hg19  "common_CBFA2T3_and_GLIS2_Motifs_v2" -size 200 -mask -preparsedDir "$SCRATCH/cutntag/Js_HsEc/HOMER_Preparsed"
+
+annotatePeaks.pl $file hg19 -m known[1-9].motif -annStats common_CBFA2T3_and_GLIS2_annots_v3.out > CBFGLIS_CD34_CB_SEACR_common_CBFA2T3_and_GLIS2_antibody_peaks_annotated_v3.txt 
+```
+
+
+# Intersect DEGs Positions with Peaks 
+
+```{r}
+in_week6 <- DEGs.EC.week7 %>% 
+  select(gene_id, logFC, adj.P.Val) %>% 
+  rename_at(vars(logFC:adj.P.Val), ~paste0(., "_EC_Week6"))
+
+in_week12 <- DEGs.EC.week12 %>% 
+  select(gene_id, logFC, adj.P.Val) %>% 
+  rename_at(vars(logFC:adj.P.Val), ~paste0(., "_EC_Week12"))
+
+in_CBFGLISpts <- CBFGLISvsNBM %>% 
+  select(gene, logFC, adj.P.Val) %>% 
+  rename_at(vars(logFC:adj.P.Val), ~paste0(., "_CBFGLISvsNBM"))
+```
+
+```{r}
+annotate_peak_files <- dir("HOMER", pattern="_peaks_annotated.txt", recursive = TRUE, full.names = TRUE)
+# annotate_peak_files
+
+motif_results <- dir("HOMER", pattern="knownResults.txt", recursive=TRUE, full.names = TRUE)
+# motif_results
+```
+
+Glis2 == 1741
+CBFA2T3 == 1740
+
+```{r}
+annotated_peaks_CBFA2T3 <- read.delim(grep("1740", annotate_peak_files, value=TRUE), sep="\t") %>% 
+  left_join(.,in_week6, by=c("Nearest.Ensembl"="gene_id")) %>% 
+  left_join(.,in_week12, by=c("Nearest.Ensembl"="gene_id")) %>% 
+  left_join(.,in_CBFGLISpts, by=c("Nearest.Ensembl"="gene")) %>% 
+  select(Chr:End,Annotation,Nearest.Ensembl,Gene.Name, 
+         matches("_CBFGLISvsNBM"), matches("_EC"), 
+         everything()) %>% 
+  arrange(desc(logFC_CBFGLISvsNBM), desc(logFC_EC_Week6),  desc(logFC_EC_Week12))
+
+
+
+head(annotated_peaks_CBFA2T3)
+# write.csv(annotated_peaks_CBFA2T3, "TARGET_AML_CBFGLIS.models_CBFA2T3_CutnTag_Peaks_with_DEGs.csv", row.names = FALSE)
+```
+
+```{r}
+ annotated_peaks_GLIS2 <- read.delim(grep("1741", annotate_peak_files, value=TRUE), sep="\t") %>% 
+  left_join(.,in_week6, by=c("Nearest.Ensembl"="gene_id")) %>% 
+  left_join(.,in_week12, by=c("Nearest.Ensembl"="gene_id")) %>% 
+  left_join(.,in_CBFGLISpts, by=c("Nearest.Ensembl"="gene")) %>% 
+  select(Chr:End,Annotation,Nearest.Ensembl,Gene.Name, 
+         matches("_CBFGLISvsNBM"), matches("_EC"), 
+         everything()) %>% 
+  arrange(desc(logFC_CBFGLISvsNBM), desc(logFC_EC_Week6),  desc(logFC_EC_Week12))
+
+
+
+head(annotated_peaks_GLIS2)
+# write.csv(annotated_peaks_GLIS2, "TARGET_AML_CBFGLIS.models_GLIS2_CutnTag_Peaks_with_DEGs.csv", row.names = FALSE)
+```
+
+```{r}
+annotate_peaks_common <- read.delim("MergePeaks/distance_given/CBFGLIS_CD34_CB_SEACR_common_CBFA2T3_and_GLIS2_antibody_peaks_annotated_v3.txt", sep="\t") %>% 
+  rename_at(vars(matches("^PeakID")), ~gsub("(^.+hg19)..m", "\\1", .)) %>% 
+  # read.delim("MergePeaks/CBFGLIS_CD34_CB_SEACR_common_CBFA2T3_and_GLIS2_antibody_peaks_annotated.txt", sep="\t") %>% 
+  left_join(.,in_week6, by=c("Nearest.Ensembl"="gene_id")) %>%
+  left_join(.,in_week12, by=c("Nearest.Ensembl"="gene_id")) %>%
+  left_join(.,in_CBFGLISpts, by=c("Nearest.Ensembl"="gene")) %>%
+  select(Chr:End,Annotation,Nearest.Ensembl,Gene.Name,
+         matches("_CBFGLISvsNBM"), matches("_EC"),
+         everything()) %>%
+  arrange(desc(logFC_CBFGLISvsNBM), desc(logFC_EC_Week6),  desc(logFC_EC_Week12))
+
+
+head(annotate_peaks_common)
+dim(annotate_peaks_common) #1764   36
+
+# write.csv(annotate_peaks_common, "TARGET_AML_CBFGLIS.models_common_CBFA2T3_and_GLIS2_annotated_CutnTag_Peaks_with_DEGs_v2.csv", row.names = FALSE)
+```
+
+
+## Closed in Controls/Open in CBFGLIS+ CB
+
+from Jay
+ Looks like there are ~1919 C/G binding sites that don’t correspond to active enhancers/promoters in control cells, and 1193 of these overlap with genes. Jenny, would you be able to rank order the attached gene list by RNA-seq from C/G cells?
+ 
+```{bash eval=FALSE}
+annotatePeaks.pl Glis2_genes_noCD34K4me2.bed hg19 -annStats "Glis2_genes_noCD34K4me2_anno_stats.out" > Glis2_genes_noCD34K4me2_peaks_annotated.txt
+```
+
+```{r}
+ annotated_peaks_GLIS2open <- read.delim("GLIS2_Closed_in_Controls_Peaks/Glis2_genes_noCD34K4me2_peaks_annotated.txt", sep="\t") %>% 
+  left_join(.,in_week6, by=c("Nearest.Ensembl"="gene_id")) %>% 
+  left_join(.,in_week12, by=c("Nearest.Ensembl"="gene_id")) %>% 
+  left_join(.,in_CBFGLISpts, by=c("Nearest.Ensembl"="gene")) %>% 
+  select(Chr:End,Annotation,Nearest.Ensembl,Gene.Name, 
+         matches("_CBFGLISvsNBM"), matches("_EC"), 
+         everything()) %>% 
+  arrange(desc(logFC_CBFGLISvsNBM), desc(logFC_EC_Week6),  desc(logFC_EC_Week12))
+
+head(annotated_peaks_GLIS2open)
+dim(annotated_peaks_GLIS2open) #1193   25
+
+
+# write.csv(annotated_peaks_GLIS2open, "TARGET_AML_CBFGLIS.models_Glis2_genes_noCD34K4me2_annotated_CutnTag_Peaks_with_DEGs.csv")
+```
+
+## Examine FOLR Peaks
+
+```{r}
+annotated_peaks_GLIS2 %>%
+  filter(grepl("FOLR|INPPL1", Gene.Name)) %>%
+  select(Chr,Start,End,matches("Peak.ID"),Peak.Score,Strand) %>%
+  write.table(.,"GLIS2_JFS1741_FOLR_region.bed", sep="\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
+
+annotated_peaks_CBFA2T3 %>%
+  filter(grepl("FOLR|INPPL1", Gene.Name)) %>%
+  select(Chr,Start,End,matches("Peak.ID"),Peak.Score,Strand) %>%
+  write.table(., "CBFA2T3_JFS1740_FOLR_region.bed", sep="\t", col.names = FALSE, row.names = FALSE, quote = FALSE)
+
+```
+
+```{bash eval=FALSE}
+SCRATCH="/fh/scratch/delete90/meshinchi_s/jlsmith3"
+findMotifsGenome.pl GLIS2_JFS1741_FOLR_region.bed hg19 ./HOMER/GLIS2_JFS1741_FOLR_region -size 200 -mask -preparsedDir "$SCRATCH/cutntag/Js_HsEc/HOMER_Preparsed" &
+findMotifsGenome.pl CBFA2T3_JFS1740_FOLR_region.bed hg19 ./HOMER/CBFA2T3_JFS1740_FOLR_region  -size 200 -mask -preparsedDir "$SCRATCH/cutntag/Js_HsEc/HOMER_Preparsed" &
+
+annotatePeaks.pl GLIS2_JFS1741_FOLR_region.bed hg19 -annStats "GLIS2_JFS1741_FOLR_region_anno_stats.out" > GLIS2_JFS1741_FOLR_region_peaks_annotated.txt
+
+annotatePeaks.pl CBFA2T3_JFS1740_FOLR_region.bed hg19 -annStats "CBFA2T3_JFS1740_FOLR_region_anno_stats.out" > CBFA2T3_JFS1740_FOLR_region_peaks_annotated.txt
+```
+
+
+
+# Peaks Open in CBFGLIS+ vs Closed in Controls
+
+```{r}
+abberant_open <- read.delim("OverlapGlisK27me3_genes.bed", sep="\t", header=FALSE)
+
+head(abberant_open)
+dim(abberant_open)
+```
+
+```{r}
+abberant_open_DEGs <- abberant_open %>% 
+  left_join(., union, by=c("V4"="gene_name")) %>% 
+  select(V1:V6, matches("NBM"), matches("GPF"), everything(), -gene_id) %>% 
+  arrange(desc(logFC_CBFGLIS_patients_vs_NBM))
+
+# abberant_open_DEGs
+# write.csv(abberant_open_DEGs,"TARGET_AML_OverlapGlisK27me3_CutnRun_Peaks_with_DEGs.csv", row.names = FALSE)
+```
+
+# DepMap Correlated with Expression 
+
+```{r}
+abberant_open_DEGs <- read.csv("TARGET_AML_OverlapGlisK27me3_CutnRun_Peaks_with_DEGs.csv") %>% 
+  pivot_longer(col=matches("logFC"), names_to="group", values_to="fc") %>% 
+  group_by(V4) %>% 
+  mutate(Keep=any(!is.na(fc) & fc > 0)) %>% 
+  ungroup() %>% 
+  tidyr::pivot_wider(names_from=group,
+              values_from=fc)  %>%
+  filter(Keep)
+
+
+
+head(abberant_open_DEGs)
+# length(unique(abberant_open_DEGs$V4)) #22
+```
+
+```{r}
+samples_included <- samps_all %>% 
+  filter(grepl("CBFA2T3-GLIS2|NBM",Primary.Fusion) | grepl("Week", Time_Point_Group)) %>% 
+  mutate_at(vars(Group), ~ifelse(.=="FlowSorted", "AML", .)) %>% 
+  mutate_at(vars(Comparisons), ~ifelse(is.na(.), Primary.Fusion, .)) %>% 
+  mutate_at(vars(Culture_condition), ~ifelse(is.na(.), Group, .)) %>% 
+  filter(Culture_condition != "Myeloid") %>% 
+  mutate(Comparisons=factor(Comparisons, levels=rev(c(
+                                                    "EC_Week12_CBFGLIS_CordBlood","EC_Week6_CBFGLIS_CordBlood",
+                                                    "EC_Week1_CBFGLIS_CordBlood",
+                                                    "EC_Week1_GFP_CordBlood", "CBFA2T3-GLIS2",
+                                                    "NBM")))) %>%
+  set_rownames(.$Sample)
+
+  # expn_subset_long
+# table(samples_included$Primary.Fusion)
+table(samples_included$Comparisons)
+
+```
+
+
+```{r}
+mod.mat <- model.matrix(~ Comparisons, data=samples_included)
+counts_subset <- counts[,samples_included$Sample]
+keep <- rowSums(edgeR::cpm(counts_subset) >= 1) >= 3
+table(keep)
+all(abberant_open_DEGs$V4 %in% names(keep)) #OK
+
+dispersions <- lapply(unique(samples_included$Comparisons), function(group){
+
+  df <- samples_included[samples_included$Comparisons==group,]  
+  
+  dge <- edgeR::DGEList(counts=counts_subset[keep,df$Sample],
+                        samples = df)
+  dge <- edgeR::calcNormFactors(dge)
+  dge <- edgeR::estimateCommonDisp(dge)
+  dge <- edgeR::estimateTagwiseDisp(dge)
+  data.frame(Comparisons=group, 
+             disp=dge$tagwise.dispersion, 
+             AveLogCPM=dge$AveLogCPM,
+             gene_name = rownames(dge)) 
+}) %>% 
+  bind_rows()
+
+head(dispersions)
+```
+
+```{r}
+# plotBCV(dge, col.trend="blue")
+included <- intersect(abberant_open_DEGs$V4, colnames(depmap)) 
+
+expn_subset_long <- TPM[included, samples_included$Sample] %>%
+  rownames_to_column("gene_name") %>% 
+  pivot_longer(cols = matches("^TARGET"), 
+               names_to="Sample", 
+               values_to="TPM") %>% 
+  mutate(log2_TPM=log2(TPM+1)) %>% 
+  left_join(., samples_included, by="Sample") %>% 
+  mutate(Facet=case_when(
+    Comparisons == "NBM" | Comparisons == "CBFA2T3-GLIS2" ~ "primary",
+    TRUE ~ "transduced"))
+
+
+expn_subset_summarized <- expn_subset_long %>% 
+  filter(Culture_condition!= "Myeloid") %>% 
+  group_by(gene_name, Comparisons, Facet) %>% 
+  summarise(mean_log2_TPM=mean(log2_TPM), .groups="keep") %>% 
+  ungroup() %>% 
+  left_join(., dispersions, by=c("gene_name","Comparisons"))
+
+options(scipen=999)
+# expn_subset_summarized
+# head(expn_subset_long)
+```
+
+```{r}
+head(depmap_samples)
+```
+
+
+```{r}
+depmap_scores_subset <- depmap_scores %>% 
+  select(1, all_of(included)) %>% 
+  pivot_longer(cols=all_of(included), 
+               names_to="gene_name", 
+               values_to="score") %>% 
+  left_join(., depmap_samples, by="DepMap_ID") %>% 
+  filter(grepl("M07E", stripped_cell_line_name)) %>% 
+  arrange(score)
+
+
+depmap_scores_expn <- depmap_scores_subset %>% 
+  left_join(., expn_subset_long, by="gene_name") 
+
+
+# write.csv(depmap_scores_subset, "DepMap/DepMap_M07E_scores_for_genes_with_OverlapGlisK27me3_CutnRun_Peaks_and_DEGs.csv", row.names = FALSE)
+```
+
+```{r fig.width=15, fig.height=15}
+genes_of_interest <- depmap_scores_subset %>% 
+  arrange(score) %>% 
+  filter(score < -0.1) %>% 
+  pull(gene_name) 
+
+included_genes <- depmap_scores_expn %>% 
+  filter(gene_name %in% genes_of_interest) %>% 
+  mutate(gene_name=factor(gene_name, levels=genes_of_interest)) %>% 
+  arrange(gene_name) %>% 
+  mutate(label=paste(gene_name, round(score, digits = 2), sep=": score ")) %>% 
+  mutate(label=factor(label, levels=unique(label)))
+  
+
+all_abberant_targets <- ggplot(included_genes,
+                               aes(y=log2_TPM, x=Comparisons, fill=Comparisons)) +
+  geom_point(aes(color=Comparisons), position = position_jitter()) +
+  geom_boxplot(alpha=0.3, outlier.color = NA) + 
+  scale_fill_manual(values=ggpubr::get_palette("jco", 7)) +
+  scale_color_manual(values=ggpubr::get_palette("jco", 7)) +
+  facet_wrap(~Facet, scales = "free") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1)) 
+
+all_abberant_targets
+# ggsave("TARGET_AML_OverlapGlisK27me3_CutnRun_Peaks_with_DEGs_with_DepMap_score_LT.-0.1_boxplots.pdf", all_abberant_targets, device = "pdf", height = 7, width = 10)
+
+# pdf("TARGET_AML_OverlapGlisK27me3_CutnRun_Peaks_with_DEGs_with_DepMap_score_LT.-0.1_facet_boxplots.pdf", height = 15, width = 20)
+# all_abberant_targets +
+#   facet_wrap(~label+Facet, scales = "free_x")
+# dev.off()
+```
+
+```{r fig.height=7, fig.width=12}
+ggplot(depmap_scores_subset, aes(x=mean_log2_TPM, y=score, color=Comparisons)) +
+  geom_point() +
+  # geom_smooth(method = 'lm') +
+  theme_classic()
+```
+
+```{r}
+# missing <- setdiff(abberant_open_DEGs$V4, colnames(depmap)) 
+depmap_subset <- depmap %>% 
+  select(1, all_of(included)) %>% 
+  pivot_longer(cols=all_of(included), 
+               names_to="gene_name", 
+               values_to="probability") %>% 
+  left_join(., depmap_samples, by="DepMap_ID") %>% 
+  left_join(., expn_subset_summarized, by="gene_name") %>% 
+  filter(grepl("M07E", stripped_cell_line_name)) %>% 
+  select(DepMap_ID:stripped_cell_line_name, 
+         Comparisons:AveLogCPM, everything())
+  
+
+
+depmap_subset
+```
+
+Jay wants to show the variability of gene expression WITHIN CBFGLIS and the models, so requested a measure of dispersion to illustrate this. 
+
+```{r fig.height=10, fig.width=12}
+ggplot(depmap_subset, aes(x=mean, y=probability, color=Comparisons)) +
+  geom_point() +
+  scale_color_manual(values=ggpubr::get_palette("jco", 7)) +
+  facet_wrap(~Comparisons, scales="free") +
+  theme_classic()
+```
+
+```{r fig.height=10, fig.width=12}
+ggplot(dispersions, aes(x=AveLogCPM, y=disp)) +
+  geom_point() +
+  geom_point(data=depmap_subset,
+             mapping=aes(x=AveLogCPM,y=disp, color=Comparisons)) +
+  facet_wrap(~Comparisons, scales="free") +
+  theme_classic()
+```
+
+
+# Reference genome 
+
+```{r}
+# suppressPackageStartupMessages(library(Biostrings))
+# suppressPackageStartupMessages(library(GenomicFeatures))
+```
+
+```{r}
+transcriptIDmap <- read.csv("References/defaultIsoform.human_XioatuMa_2021.csv")
+
+dim(transcriptIDmap)
+```
+
+```{r}
+IDmap <- read.csv(file.path(PROJHOME,"0000.00.02_Reference_GeneInfo/GeneSymbol_Ensembl_ID_Conversion_GRCh37.69_FromBCCA.csv")) %>% 
+  mutate_at(vars(geneSymbol), ~gsub("^MLL3$","KMT2C", .))
+
+head(IDmap)
+
+
+#BCCA version used old nomenclature of MLL3. 
+# IDmap %>% 
+#   filter(grepl("MLL3|KMT2C", geneSymbol))
+```
+
+```{r message=FALSE}
+Grch37.txdb <- AnnotationDbi::loadDb(file.path(PROJHOME, "0000.00.02_Reference_GeneInfo/GRCh37-lite_Ensembl_v69_TxDB.sqlite"))
+Grch37.txdb
+```
+
+```{r}
+Grch37.lite <- file.path(GENREFS,"GRCh37/fasta/genome/Grch37-lite/GRCh37-lite.fa")
+chrom_len_file <- file.path(PROJHOME, "0000.00.02_Reference_GeneInfo/Grch37.lite_chrom_lengths.txt")
+
+seqlens <- read.delim(chrom_len_file) %>% 
+  rownames_to_column("chr") %>%
+  pull(x, name=chr)
+
+
+# seqlens <- BSgenome::fasta.seqlengths(Grch37.lite)
+# write.table(seqlens,"Grch37.lite_chrom_lengths.txt",sep="\t",quote = F)
+# head(seqlens)
+```
+
+```{r}
+#Select all the genes 
+genes.ranges <- genes(Grch37.txdb)
+
+
+#define the promoter region as -1kbp to +200bp of TSS
+promoter <- promoters(genes.ranges, upstream=1000, downstream=200)
+```
+  
+```{r}
+# CBFA2T3.peaks <- 
+```
+
+  
+```{r}
+#Subset the methylation set by the genomic loci on the gene
+olap.prom <- subsetByOverlaps(methylationSet, promoter)
+olap.gene <- subsetByOverlaps(methylationSet, txs)
+```
+
+
+
+
+
+
+#Session info

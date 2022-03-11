@@ -1,0 +1,975 @@
+---
+title: "CBFGLIS-Like AML"
+author: "Jenny Smith"
+date: "April 12, 2018"
+output: html_document
+---
+
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.width=10, fig.height = 10)
+knitr::opts_knit$set(root.dir = '~/RNA_seq_Analysis/2018.03.21_CBF-GLIS_DEGs_Comprehensive/')
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(tibble)
+library(dendextend)
+getwd()
+```
+
+
+```{r}
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/DifferentialExpressionPipeline_3.21.18.r")
+source("~/scripts/survival_analysis/Survplot_Functions_2017.03.31.r")
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/Heatmaps_Function.r")
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/ggplot_Themes_Function.r")
+```
+
+
+#Define Functions 
+
+```{r}
+pheno_bars <- function(CDE,IDCol,cols){
+  
+  replace_yes <- function(col,name){
+    name <-gsub(".RNAseq|.positive.", "", name)
+    col <- ifelse(col == "Yes", name, col)
+    return(col)
+  }
+  
+  colorbar.df <- CDE %>%
+    select(IDCol,cols)
+  
+  if(length(cols) > 1){
+    colorbar.df <- bind_cols(colorbar.df, mapply(replace_yes, CDE[,cols], cols, SIMPLIFY = FALSE))
+  }else{
+    new <- data.frame(replace_yes(CDE[,cols],cols)) %>% set_colnames(cols)
+    colorbar.df <- bind_cols(colorbar.df, new) #dplyr bind_cols throws error Error in cbind_all(x) : Argument 2 must have names??
+  }
+    
+
+  p <- NULL
+  for (col in cols){p <- paste(p,colorbar.df[,paste0(col,1)], sep="_")}
+  
+  colorbar <- p %>%
+    gsub("No|Unknown|_", "", .) %>%
+    gsub("^$", "OtherAML",.) %>%
+    set_names(CDE[,IDCol])
+
+  return(colorbar)
+  
+}
+```
+
+
+ 
+```{r}
+color_bars <- function(list.labels,colorDends_Groups.res){
+  
+  cb1 <- list.labels[[1]][names(colorDends_Groups.res$groups)] #subset & order
+  cb2 <- list.labels[[2]][names(colorDends_Groups.res$groups)]
+        
+  cb.all <- data.frame(Cytogenetics=cb1,
+                     FLT3.ITD=cb2,
+                     Cytogenetics.Num=as.numeric(as.factor(cb1)),
+                     FLT3.ITD.Num=as.numeric(as.factor(cb2)),
+                     Hier.Cluster.Group=colorDends_Groups.res$groups)
+
+  c <- c("red","deepskyblue","darkorchid1","blue3","gold2")
+  c2 <- c("darkolivegreen2","darkslategray")
+  c3 <- c("firebrick1", "dodgerblue3")
+        
+  colors <- data.frame(Fusions=c[cb.all[,"Cytogenetics.Num"]],
+                     FLT3=c2[cb.all[,"FLT3.ITD.Num"]],
+                     Group=c3[cb.all[,"Hier.Cluster.Group"]],
+                     stringsAsFactors = TRUE)
+  return(colors)
+}
+```
+
+
+```{r}
+saveMultiPlots.dplyr <- function(dplyr.do,w=8,h=5){
+  #This is for the relapse results from plots with do() command in 
+  
+  N <- nrow(dplyr.do)
+  
+  name <- function(i){paste(dplyr.do[[1]][i],col,".tiff", sep="_")}
+  cols <- colnames(dplyr.do)[-1]
+  
+  for (col in cols){
+    lapply(1:N, function(x) ggsave(filename = name(x),
+                                   plot = dplyr.do[[col]][[x]],
+                                   device = "tiff",
+                                   width = w,
+                                   height = h,
+                                   dpi=600))
+    
+  }
+}
+```
+
+
+
+#Read in the CDEs
+
+```{r}
+CDE.0531 <- read.csv("~/reference_mapping-files/TARGET_AML_current_asof_june30_2016_UPDATED_CLEAN_4.19.18.csv",
+                     stringsAsFactors = FALSE)
+
+head(CDE.0531[,1:5])
+```
+
+```{r}
+table(CDE.0531$CBFA2T3.GLIS2)
+```
+
+```{r}
+CDE.1031 <- read.csv("~/reference_mapping-files/TARGET_AML_1031_CDE_cleaned_5.14.18.csv", 
+                     stringsAsFactors = FALSE)
+
+
+head(CDE.1031[,1:5])
+```
+
+```{r}
+table(CDE.1031$CBFA2T3.GLIS2)
+table(CDE.1031$CBFA2T3.GLIS2_RNASeqCalls)
+```
+
+
+
+#Combined 1031 and 0531 CDE
+
+```{r}
+merged <- read.csv("~/reference_mapping-files/TARGET_AML_1031_0531_Merged_CDE_3.30.18.csv",
+                   stringsAsFactors = FALSE, row.names = 1)
+
+head(merged[,1:5])
+# dim(merged) #2559   34
+```
+
+```{r}
+table(merged$CBFA2T3.GLIS2)
+pos.all <- subset(merged, CBFA2T3.GLIS2=="Yes")$TARGET.USI.1
+neg.all <- subset(merged, CBFA2T3.GLIS2=="No")$TARGET.USI.1
+```
+
+
+```{r}
+cols <- c("CBFA2T3.GLIS2","NUP98.KDM5A","RBM15.MKL1","DEK.NUP214")
+cols2 <- c("CEBPA.mutation","NPM.mutation")
+  
+labels1 <- pheno_bars(CDE=merged, IDCol = "TARGET.USI.1", cols=cols)
+labels2 <- pheno_bars(CDE=merged, IDCol = "TARGET.USI.1", cols="FLT3.ITD.positive.")
+labels3 <- pheno_bars(CDE=merged, IDCol="TARGET.USI.1",cols=cols2)
+
+table(labels1)
+table(labels2)
+table(labels3)
+# head(labels1)
+# head(labels2)
+```
+  
+        
+
+
+#Load the Expression Data
+
+```{r}
+# CBFvsAML <- get(load("DEGs/TARGET_AML_AllCohorts_CBFGLISvsOtherAML_Voom_DEGs.RData"))
+# 
+# names(CBFvsAML)
+```
+
+
+```{r}
+# tpm.1031 <- read.csv("~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/TARGET_AML_AAML1031_dupGenesRemoved_TPM.csv",
+#                      stringsAsFactors = FALSE, row.names = 1)
+# head(tpm.1031[,1:5])
+# dim(tpm.1031) #1,111 samples
+```
+
+```{r}
+# tpm.0531 <- read.csv("~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/TARGET_AML_AAML0531_dupGenesRemoved_TPM.csv",
+#                      stringsAsFactors = FALSE, row.names = 1)
+# head(tpm.0531[,1:5])
+# dim(tpm.0531) #494 samples
+```
+
+```{r}
+# GOI <-  tpm.1031 %>%
+#   as.data.frame() %>%
+#   rownames_to_column("gene") %>%
+#   filter(grepl("NCAM1|KIT$|IL3RA", gene)) %>%
+#   gather(var,value, -gene) %>%
+#   mutate_if(is.numeric, function(x) log2(x+0.5)) %>%
+#   spread(gene, value) %>%
+#   set_colnames(c("USI","IL3RA.Log2.TPM", "KIT.Log2.TPM","NCAM1.Log2.TPM"))
+#   # filter(!grepl("^BM|^RO", var))
+
+# GOI
+```
+
+```{r}
+# filter(GOI, gene == "NCAM1") %>%
+#   select(value) %>%
+#   unlist() %>%
+#   quantile
+```
+
+
+#Read in the SNV Data 
+
+```{r}
+SNVs.0531 <- read.table("~/RNA_seq_Analysis/2018.03.21_CBF-GLIS_DEGs_Comprehensive/2017.02.15_CBF-GLIS_DEG/ExpressionData/annotatedVarsTbl684DxSamples.txt", header = TRUE, stringsAsFactors = FALSE, sep="\t")
+
+head(SNVs.0531[,1:5])
+# dim(SNVs) #684 patiens and 191 genes
+```
+
+```{r}
+SNVs.1031 <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/level2/SNVs/2017July_BCCA_1031_Illumina_data/TARGET_AML_1031_TargetedAlignment_RNAseq_SNVs_filtered_counts_GT.40counts.csv", stringsAsFactors = FALSE)
+
+head(SNVs.1031[,1:5])
+```
+
+```{r}
+TCS.SNVs <- read.csv("~/AML_Literature/TARGET_landscape/TARGET_AML_LandscapePaper_SuppTables_final9June2017_Strelka_mPileUp_TCS.csv", 
+                     stringsAsFactors = FALSE)
+
+head(TCS.SNVs)
+```
+
+
+#Read in the Flow Data
+
+```{r}
+MFI <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/FlowCytometry/MFI/2017July_Hematologics_MeanFluorescenceIntensity/TARGET_AML_0531_27June2017-2017-7-18FD_FLOWcytometetryData.csv", stringsAsFactors = FALSE)
+
+
+MFI <- MFI %>% 
+  filter(!is.na(CD45))
+  #Older code to remove the false positives from CBF/GLIS column. 
+  # mutate_at(vars(CBFGLIS.Status), funs(ifelse(TARGET.USI %in% pos.all, "Yes", 
+  #                                       ifelse(TARGET.USI %in% neg.all, "No", "Unknown"))))
+
+# dim(MFI) #437  20
+head(MFI)
+# write.csv(MFI,"/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/FlowCytometry/MFI/2017July_Hematologics_MeanFluorescenceIntensity/TARGET_AML_0531_27June2017_2017.7.18FD_FLOWcytometetryData_FIXED_CBFGLIS_FalsePositives.csv", row.names = FALSE )
+```
+
+```{r}
+MFI.1031 <- read.csv("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/FlowCytometry/MFI/2018Mar_Hematologics_CD117_CD123/CD123_117_CDE.csv",
+                     stringsAsFactors = FALSE)
+
+MFI.1031 <- MFI.1031 %>% 
+  inner_join(.,select(CDE.1031, USI,Patient.ID, CBFA2T3.GLIS2), by="Patient.ID") %>%
+  select(USI,everything())
+
+head(MFI.1031)
+# dim(MFI.1031) #892  
+```
+
+
+```{r}
+Top2Perc <- read.csv("CBFGLIS.like/TARGET_AML_1031_CBFGLIS.like_Groups_3.28.18.csv")
+
+head(Top2Perc)
+g1 <- subset(Top2Perc, x == 1)$X
+```
+
+
+
+
+#Descibe the objectives 
+
+To define a set of genes which can be used to reliably detect the CBFGLIS and CBFGLIS.like 
+
+Responses to Investigate 
+A) Age
+B) HH activation 
+C) poor outcome (OS/EFS)
+D) higher CD56 expression 
+
+#Define Functions to be used
+
+```{r}
+glm.gaussian <- function(x,y,df){
+  # xi s character vector with column names of the expression data (pateitns as rows)
+  #y is the character vector with the column of  response variable (numeric)
+  #df is the training dataframe with x cols and y col. 
+  
+  sparsemat_to_df <- function(coef){
+    #sparsemat is a sparce matrix from the output of predict(.,type="coefficients")
+    coef <- data.frame(coef=coef[,1]) %>%
+        rownames_to_column("gene") %>%
+        filter_all(all_vars(. != 0))
+    return(coef)
+  }
+  
+  #define the training set. 
+  train.data <- as.matrix(df[,c(x,y)])
+  
+  #grid of lambda values to test.
+  grid <- 10^ seq(10,-2, length=100)
+
+  #training model.
+  mod <- glmnet(x=train.data[,x],y=train.data[,y],
+                family = "gaussian",
+                standardize = FALSE,
+                lambda = grid,
+                intercept = FALSE)
+  
+  #use cross-validation on the training model.CV only for lambda
+  #CV with LOOCV == nfolds are # of samples in training set
+  set.seed(2018)
+  cv.lambda <- cv.glmnet(train.data[,x], train.data[,y],
+                         family = "gaussian",
+                         standardize = FALSE,
+                         lambda = grid,
+                         nfolds = nrow(train.data),
+                         type.measure = "deviance")
+
+
+
+  #Select lambda min.
+  lambda.min <- cv.lambda$lambda.min
+  coef.trainingMod <- predict(mod, type="coefficients", s=lambda.min)
+  nonZero.train <- sparsemat_to_df(coef.trainingMod)
+  
+  res <- list("training.mod"=mod,"cv.lambda"=cv.lambda, "lambda.min"=lambda.min, "coef.trainingMod"=coef.trainingMod, "nonZero.train"=nonZero.train)
+  return(res)
+
+}
+```
+
+
+#Examine Patients with High CD56 
+
+
+```{r}
+merged.subset <- merged %>%
+  filter(TARGET.USI.1 %in% intersect(merged$TARGET.USI.1, colnames(tpm.1031))) %>%
+  inner_join(., GOI, by=c("TARGET.USI.1" = "USI"))
+
+
+head(merged.subset)
+# table(merged.subset$CBFA2T3.GLIS2)
+```
+
+
+```{r}
+merged.subset.OS <- merged.subset %>%
+  filter(!is.na(OS.ID)) %>%
+  set_rownames(.$TARGET.USI.1)
+
+# head(merged.subset.OS)
+table(merged.subset.OS$CBFA2T3.GLIS2)
+```
+
+```{r}
+q3 <- quantile(subset(merged.subset, CBFA2T3.GLIS2 == "Yes")$NCAM1.Log2.TPM, 0.75)
+q1 <- quantile(subset(merged.subset, CBFA2T3.GLIS2 == "Yes")$NCAM1.Log2.TPM, 0.25)
+
+q1
+q3
+```
+
+```{r}
+CD56 <- merged.subset %>%
+  mutate(HighCD56=ifelse(NCAM1.Log2.TPM >= q1, "HighCD56","LowCD56")) %>%
+  mutate(HighCD56=ifelse(CBFA2T3.GLIS2 == "Yes", "CBFA2T3.GLIS2", HighCD56)) %>%
+  group_by(CBFA2T3.GLIS2) 
+  # summarize(range=paste(round(quantile(NCAM1.log2TPM),digits = 2), collapse = "-"))
+
+CD56
+# table(CD56$HighCD56)
+```
+
+```{r fig.width=5, fig.height=4}
+ggplot(CD56, aes(x=HighCD56, y=NCAM1.Log2.TPM, fill=HighCD56)) + 
+  geom_violin()
+```
+
+
+
+#Examine Patients CD117 Expression
+
+```{r}
+MFI.1031 <- MFI.1031 %>%
+  mutate_at(vars(CD117:CD123), funs(Log2.MFI=log2(.+1))) %>%
+  mutate_at(vars(CBFA2T3.GLIS2), funs(factor(., levels=c("No","Yes","Unknown")))) 
+
+head(MFI.1031)
+# write.csv(MFI.1031, "FlowCytometry/TARGET_AML_1031_MFI_CD117_CD123_withCBFGLIS.csv", row.names = FALSE)
+```
+
+```{r}
+MFI <- MFI %>% 
+  mutate_at(vars(CD45:CD117), funs(Log2.MFI=log2(.+1)))
+head(MFI)
+# write.csv(MFI, "FlowCytometry/TARGET_AML_0531_MFI_withCBFGLIS.csv", row.names = FALSE)
+```
+
+
+```{r fig.height=5}
+# tiff("TARGET_AML_1031_CD117_ViolinPlots.tiff", height = 5, width = 10,res=600, units="in")
+ggplot(MFI.1031, aes(x=CBFA2T3.GLIS2, y=CD117_Log2.MFI, fill=CBFA2T3.GLIS2)) + 
+  geom_violin(draw_quantiles = c(0.5), color="azure3", size=1.25) + 
+  theme_numX +
+  labs(title="CD117 Expression in CBFA2T3-GLIS2 AML \n COG AAML1031", x="") +
+  scale_fill_manual(values = c("navy","red2","aliceblue")) + 
+  theme(legend.text = element_text(size=12), 
+        legend.title = element_text(size=15))
+# dev.off()
+```
+
+
+```{r fig.height=5}
+# tiff("TARGET_AML_0531_CD117_ViolinPlots.tiff", height = 5, width = 10,res=600, units="in")
+ggplot(MFI, aes(x=CBFGLIS.Status, y=CD117_Log2.MFI, fill=CBFGLIS.Status)) + 
+  geom_violin(draw_quantiles = c(0.5), color="azure3", size=1.25) + 
+  theme_numX +
+  labs(title="CD117 Expression in CBFA2T3-GLIS2 AML \n COG AAML0531", x="") +
+  scale_fill_manual(values = c("navy","red2")) + 
+  theme(legend.text = element_text(size=12), 
+        legend.title = element_text(size=15))
+# dev.off()
+```
+
+
+
+#Define the training and testing sets
+
+```{r}
+#Selecting a training set with OS/EFS data, but the split will be 1/2 and 1/2 overall 
+pos.withOS <- subset(merged.subset.OS, CBFA2T3.GLIS2 == "Yes")$TARGET.USI.1
+neg.withOS <- subset(merged.subset.OS, CBFA2T3.GLIS2 == "No")$TARGET.USI.1
+
+pos.1031 <- subset(merged.subset, CBFA2T3.GLIS2 == "Yes")$TARGET.USI.1
+neg.1031 <- subset(merged.subset, CBFA2T3.GLIS2 == "No")$TARGET.USI.1
+```
+
+```{r}
+set.seed(2018)
+
+train <- c(sample(pos.withOS, size=11, replace=FALSE), sample(neg.withOS, size=510, replace = FALSE))
+test <- c(pos.1031[! pos.1031%in% train],  neg.1031[! neg.1031 %in% train])
+```
+
+
+
+#Differential Expression 
+
+To ensure that were not stacking the deck, will need to do differential expression on the 11 CBFGLIS in the training set vs 510 other AMLs to be used as input for the regression analyses. 
+
+
+```{r}
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/DifferentialExpressionPipeline_3.21.18.r")
+```
+
+
+```{r}
+# tiff("TARGET_AML_1031_CBFGLISvsOtherAML_TrainingSet.pdf", height = 10, width = 10, res=600, units="in")
+# CBFvsOtherAML <-  twoGroups_DEGs(expnData = cts.list$hd.1031,
+#                                  clinData=merged.subset.OS[train,],
+#                                  col="CBFA2T3.GLIS2",
+#                                  ref = "No",
+#                                  logCPM=FALSE,
+#                                  BM=FALSE)
+# dev.off()
+# save(CBFvsOtherAML, file="TARGET_AML_1031_CBFGLISvsOtherAML_TrainingSet.RData")
+
+CBFvsOtherAML <- get(load("CBFGLIS.like_4.12.18/TARGET_AML_1031_CBFGLISvsOtherAML_TrainingSet.RData"))
+```
+
+
+```{r}
+table(CBFvsOtherAML$phenovector)
+# CBFvsOtherAML$phenovector[1:20]
+```
+
+
+```{r}
+DEGs <- extract_DEGs(CBFvsOtherAML)
+# dim(DEGs)
+# head(DEGs) #3118 DEGs
+# tail(DEGs, n=100)
+```
+
+
+```{r}
+DEGs <- DEGs %>%
+  filter(adj.P.Val < 0.001) #ensure significant 
+
+head(DEGs)
+# dim(DEGs) #1,843 DEGs
+# tail(DEGs,n=100)
+```
+
+Note: its odd that they are ALL upregulated genes??? No, its only that R shows a max of 1,000 lines. 
+
+
+
+#Use Lasso Regression for Age 
+
+Want to find genes associated with lower age patients, and we know that these genes are already associated with poor prognosis (CBF/GLIS) so likely wil be selecting for the patients who are younger with poor outcomes. 
+
+But the question is, is it regressing increased gene expression with increased age? so really want to use like 1/age so younger patients increased.
+
+Another consideration is that since these were the patients used to find the DEGs (training) and then training on them to reduce the # of genes, even though the response (age) wasn't included in the previous selection of DEGs it was an "invisible/latent variable" (something like that) because we know that the patients are younger anyways... however, on its face, techinically ok to do varibale pre-selection based on your criteria, and our criteria was that these genes had to be differentially expressed.  
+
+Mayneed to use the HD.0531 for DEGs list. This would not be optimal but at least its not
+
+```{r}
+sparsemat_to_df <- function(coef){
+    #sparsemat is a sparce matrix from the output of predict(.,type="coefficients")
+    coef <- data.frame(coef=coef[,1]) %>%
+        rownames_to_column("gene") %>%
+        filter_all(all_vars(. != 0))
+    return(coef)
+}
+```
+
+```{r}
+x <- t(log2(tpm.1031[DEGs$gene,train]+1))
+dim(x)
+head(x[,1:5])
+```
+
+```{r}
+hist(x) #No negatives??
+```
+
+
+
+```{r}
+y <- 1/merged.subset.OS[train,"Age.Yrs"] %>% set_names(train)
+length(y)
+head(y)
+```
+
+```{r}
+hist(y)
+```
+
+
+#LASSO Regression with Age 
+
+
+```{r}
+library(glmnet)
+```
+
+
+```{r}
+#define the training set. 
+train.data <- as.matrix(cbind(x,y))
+  
+#grid of lambda values to test.
+grid <- 10^ seq(10,-2, length=100)
+
+#training model.
+mod <- glmnet(x=train.data[,DEGs$gene],y=train.data[,"y"],
+                family = "gaussian",
+                standardize = FALSE,
+                lambda = grid,
+                intercept = FALSE)
+```
+
+```{r}
+#use cross-validation on the training model.CV only for lambda
+#CV with LOOCV == nfolds are # of samples in training set
+set.seed(2018)
+cv.lambda <- cv.glmnet(train.data[,DEGs$gene], train.data[,"y"],
+                         family = "gaussian",
+                         standardize = FALSE,
+                         lambda = grid,
+                         nfolds = nrow(train.data),
+                         type.measure = "deviance")
+
+
+
+#Select lambda min.
+lambda.min <- cv.lambda$lambda.min
+coef.trainingMod <- predict(mod, type="coefficients", s=lambda.min)
+nonZero.train <- sparsemat_to_df(coef.trainingMod)
+```
+
+
+NOTE:Option grouped=FALSE enforced in cv.glmnet, since < 3 observations per fold
+
+For my error metrics, will need to cluster or group the CBFGLIS by thier genes selected with non-zero coefficients. 
+```{r fig.height=5, fig.width=10}
+plot(cv.lambda)
+# plot(mod)
+```
+
+```{r}
+idx <- which(cv.lambda$glmnet.fit$df > 0)
+lambdas <- cbind(cv.lambda$glmnet.fit$df,cv.lambda$glmnet.fit$lambda) %>% .[idx,]
+lambdas
+```
+
+```{r}
+# CBF.DEGsVsInverseAge <- nonZero.train
+CBF.DEGsVsInverseAge <- predict(mod, type="coefficients", s=lambdas[7,2]) %>%
+  sparsemat_to_df(.)
+
+options(scipen = 999)
+CBF.DEGsVsInverseAge
+# write.csv(CBF.DEGsVsInverseAge, "TARGET_AML_1031_TrainingSet_NonZeroCoeff_LambdaMin_Genes.csv", row.names = FALSE)
+ # write.csv(CBF.DEGsVsInverseAge, "TARGET_AML_1031_TrainingSet_NonZeroCoeff_Lambda44Genes.csv", row.names = FALSE)
+```
+
+
+#Examine the Properties of Groups determine by these genes. 
+
+```{r}
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/Heatmaps_Function.r")
+source("~/scripts/survival_analysis/Survplot_Functions_2017.03.31.r")
+```
+
+A) look at clustering with the TPM values for these genes 
+B) look at clustering with the "scores" for these genes. 
+
+```{r}
+scores.mod <- function(expnData,NonZeroCoeff.res){
+  #expnData has genes as columns, patients as rownames. 
+  
+  expnData <- expnData[, intersect(NonZeroCoeff.res$gene, colnames(expnData))] %>% 
+    as.data.frame()
+
+  
+  scores <- apply(expnData,1, function(x) x* NonZeroCoeff.res$coef) %>% #multiple each row by the coeff.
+    colSums(.)  #sum the weighted expression values
+    # set_names(rownames(expnData))
+  
+  return(scores)
+}
+```
+
+
+```{r warning=FALSE}
+InvsAge.Scores <- scores.mod(train.data, CBF.DEGsVsInverseAge)
+head(InvsAge.Scores)
+
+# hist(InvsAge.Scores)
+# InvsAge.Scores[1:5,1:5]
+# options(scipen = 999)
+# sum(train.data[3,CBF.DEGsVsInverseAge$gene] * CBF.DEGsVsInverseAge$coef)
+```
+
+```{r fig.height=4, fig.width=16}
+d.InvAge <- dge_dendrograms(expnData = tpm.1031, pheno = CBFvsOtherAML$phenovector, genelist = CBF.DEGsVsInverseAge$gene, method="ward.D2")
+
+```
+
+
+```{r fig.height=4, fig.width=16}
+d.InvAge.Scores <- hclust(dist(InvsAge.Scores), method = "ward.D2")
+d.InvAge.Scores <- list(c1=d.InvAge.Scores)
+
+plot(d.InvAge.Scores$c1, cex=0.15)
+```
+
+```{r}
+cc.CBF.GLIS <- c("GroupA"="red", "GroupB"="navy")
+dends.InvsAge <- colorDends_Groups(d.InvAge, 
+                                   phenovector = CBFvsOtherAML$phenovector, k=2, colorcodes = cc.CBF.GLIS)
+
+```
+
+```{r}
+dends.InvsAge.Scores <- colorDends_Groups(d.InvAge.Scores, 
+                                   phenovector = CBFvsOtherAML$phenovector, k=2, colorcodes = cc.CBF.GLIS)
+```
+
+```{r fig.width=16, fig.height=4}
+# plot(dends.InvsAge$dend)
+# # plot(dends.InvsAge$split_dends[[2]]) #103 patients 
+color.df <- color_bars(list.labels = list(labels1,labels2),colorDends_Groups.res = dends.InvsAge)
+head(color.df)
+```
+
+
+```{r fig.width=16, fig.height=5}
+par(mfrow=c(1,1), cex=0.125, mar=c(40, 7.5, 8.5, 2), pty="m")
+plot(dends.InvsAge$dend, axes=TRUE,cex.axis=9, horiz=FALSE)
+par(cex=0.8, cex.main = 1, cex.lab = 0.85)
+colored_bars(colors = color.df, y_scale=30, rowLabels=c("", ""))
+```
+
+
+```{r fig.width=16, fig.height=5}
+par(mfrow=c(1,1), cex=0.2, mar=c(40, 7.5, 8.5, 2), pty="m")
+plot(dends.InvsAge.Scores$dend,axes=TRUE,cex.axis=9, horiz=FALSE)
+par(cex=0.8, cex.main = 1, cex.lab = 0.85)
+```
+
+
+```{r}
+sum(dends.InvsAge$group_labels[[1]] %in% g1) 
+sum(dends.InvsAge$group_labels[[1]] %in% pos.1031) 
+CBFGLIS.likeOnly <- setdiff(dends.InvsAge$group_labels[[1]], pos.1031)
+otherAML <- unlist(dends.InvsAge$group_labels[c(2:3)])
+```
+
+```{r}
+CDE.InvsAge <- merged.subset.OS %>%
+  inner_join(., data.frame(USI=names(dends.InvsAge$groups), Group=dends.InvsAge$groups), by=c("TARGET.USI.1"="USI")) %>%
+  mutate(Group=ifelse(CBFA2T3.GLIS2 == "Yes", "CBFA2T3.GLIS2", Group)) %>%
+  mutate(X=rep("AML", nrow(.)))
+
+table(CDE.InvsAge$Group)
+```
+
+```{r}
+CDE.InvsAge %>%
+  group_by(Group) %>%
+  summarise(med.age=median(Age.Yrs), range.yrs=paste(round(range(Age.Yrs), digits = 2), collapse = " - "))
+
+# write.csv(CDE.InvsAge, "TARGET_AML_1031_CBFGLIS.like_LassoInvAge_Lambda44Genes_Groups.csv", row.names = FALSE)
+ # write.csv(CDE.InvsAge, "TARGET_AML_1031_CBFGLIS.like_LassoInvAge_Lambda44Genes_5Groups.csv", row.names = FALSE)
+```
+
+```{r fig.width=10, fig.height=4}
+g1.InvsAge <- subset(CDE.InvsAge, Group == "1")
+
+ggplot(g1.InvsAge, aes(x=reorder(g1.InvsAge$TARGET.USI.1,g1.InvsAge$Age.Yrs), y=Age.Yrs)) + 
+  geom_bar(stat = "identity", fill="blue",color="blue") + 
+  scale_y_continuous(breaks = seq(0,25,by=3)) +
+  geom_hline(yintercept  = 5) + 
+  theme_bw() #about 2/3 are under the age of 5. 
+```
+
+
+```{r message=FALSE, fig.width=7, fig.height=5}
+KM.InvsAge <- KM.plots(df=CDE.InvsAge,groupBy = "X", type = "OS", covariate = "Group", cohort = "0531")
+
+KM.InvsAge$OS[[1]]
+KM.InvsAge$EFS[[1]]
+```
+
+
+Results: Using lambda for 44 genes and splitting into 2 groups, see that group 1 == CBF/GLIS-like (N=186) and have worse prognosis for OS, not so much EFS. Also, median age is ~2 years old, and range is 0.14-22.2 years. However, HH signaling is not enriched, and there are not any significant pathways either.   
+
+Using lambda for 44 genes and splitting into 5 groups, see that group 1 == CBF/GLIS-like (N=24), and groups 1 and 2 have much worse prognosis for OS not EFS.  HH enrichment is in thier top 10 enriched paths q < 0.001, but the heatmap is less than that with the full 66 CBG/GLIS-like identified with the topDEGs. 
+Also,younger age, median is 1.8 years with a range 0.58-17years. However, only 2/24 CBF/GLIS-like are older than 5 years. So 91% are less than 5 years old. 
+
+
+```{r}
+# source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/GAGE_GSEA_Function.r")
+library(gage)
+```
+
+```{r}
+sub <- subset(CDE.InvsAge, Group != "CBFA2T3.GLIS2") 
+pheno <- sub$Group %>% set_names(sub$TARGET.USI.1) %>% .[order(.)]
+expn <- CBFvsOtherAML$DE$Voom$E
+```
+
+```{r}
+quickGSA <- function(log2CPM, pheno){
+  setwd('~/RNA_seq_Analysis/2018.03.21_CBF-GLIS_DEGs_Comprehensive/')
+  library(gage)
+  library(magrittr)
+  library(dplyr)
+  #phenovector is the group #s orderered so that CBF/GLIS-like is first 
+  
+  pheno <- pheno[order(pheno)]
+  grpN <- table(pheno)
+  
+  expn <- log2CPM[,names(pheno)] 
+  end <- ncol(expn)
+  
+  C2.KEGG <- readRDS("~/RNA_seq_Analysis/0000.00.01_GSEA_geneSets_gmt/c2.cp.kegg.v6.0.symbols.RDS")
+  
+  GSA.InvsAge <- gage(exprs = expn, 
+                      gsets = C2.KEGG, 
+                      samp = c(1:grpN[1]),
+                      ref = c((grpN[1]+1):end), 
+                      same.dir = TRUE,
+                      compare = "unpaired")
+  
+  return(GSA.InvsAge)
+}
+```
+
+```{r}
+Gage.Heatmap <- function(quickGSA.res){
+  col <- colorRampPalette(c("deepskyblue4", "deepskyblue3", "deepskyblue2", "deepskyblue1","white","red1", "red2", "red3", "red4"))(n=299)
+  paths <- c(rownames(quickGSA.res$greater)[1:10], rownames(quickGSA.res$less)[1:10])
+  stat.up <- quickGSA.res$stats[paths, 2:ncol(quickGSA.res$stats)]
+  labs <- gsub("KEGG_", "", paths ) %>% gsub("_"," ", .) 
+
+  # tiff("TARGET_AML_1031_baseOnTop2Perc_CBFGLIS.likeOnly_vs_OtherAML.like_GAGE_TestStat_Heatmap_.tiff", height = 10, width=16, res=800, units="in")
+  pheatmap::pheatmap(mat=stat.up, color=col,
+                   scale = "column", cluster_rows=FALSE, kmeans_k = NA, labels_row = labs, fontsize = 10, fontsize_col =6, show_colnames=FALSE )
+}
+```
+
+```{r}
+GSA.InvsAge.5Groups <- get(load("TARGET_AML_1031_CBFGLIS.like_LassoInvAge_Lambda44Genes_5Groups_GAGE.RData"))
+head(GSA.InvsAge.5Groups$greater[,1:5], n=10)
+```
+
+```{r}
+Gage.Heatmap(GSA.InvsAge.5Groups)
+```
+
+
+
+#HH Enrichment as the response (ssGSEA)
+
+
+```{r}
+
+```
+
+
+
+
+
+#Use Lasso Regresion for Outcome 
+
+```{r}
+glm.cox <- function(x,y,trainSamp=NULL,df,standardize=FALSE){
+  library(glmnet)
+  library(tibble)
+  library(dplyr)
+  library(survival)
+  #df is the matrix with the response and  gene expression. Patients as rownames.
+  #x is the character vector name of the columns with the expression data
+  #y is the character vector or names of the columns for time and event, in that order
+  #trainSamp is an optional character vector to specify exact patient IDs to be used as training set. eg samples from only 0531. 
+
+  if (is.null(trainSamp)){
+    #Use validation set approach. split observations into approx. 2/3 and 1/3 of the data set.
+    set.seed(2018)
+    train <- sample(c(TRUE,FALSE), size = nrow(df), replace = TRUE, prob = c(0.667,0.333))
+    test <- (!train)
+  }else{
+    train <- rownames(df) %in% trainSamp
+    test <- (!train)
+  }
+  
+  sparsemat_to_df <- function(coef){
+    #sparsemat is a sparce matrix from the output of predict(.,type="coefficients")
+    coef <- data.frame(coef=coef[,1]) %>%
+        rownames_to_column("gene") %>%
+        filter_all(all_vars(. != 0))
+    return(coef)
+  }
+  
+  #define the training set. 
+  train.data <- as.matrix(df[train,c(x,y)])
+  
+  #grid of lambda values to test.
+  grid <- 10^ seq(10,-2, length=100)
+
+  #training model.
+  mod <- glmnet(x=train.data[,x],y=train.data[,y],
+                family = "cox",
+                standardize = standardize,
+                lambda = grid)
+
+  #use cross-validation on the training model.CV only for lambda
+  #CV with LOOCV == nfolds are # of samples in training set
+  set.seed(2018)
+  cv.lambda <- cv.glmnet(train.data[,x], train.data[,y],
+                         family = "cox",
+                         standardize = standardize,
+                         lambda = grid,
+                         nfolds = nrow(train.data),
+                         type.measure = "deviance")
+
+  #Select lambda min.
+  lambda.min <- cv.lambda$lambda.min
+
+  #Define a testing set dataframe
+  test.data <- df[test,] 
+
+  #predict the surival outcome. Returns relative risk of each patient
+  pred.outcome <- predict(mod, newx = as.matrix(test.data[,x]), type="response", s=lambda.min)
+
+  #find the test error. Hazard Ratio and P-value of curves. so use the coeff from train to calc LSC scores?
+  coef.trainingMod <- predict(mod, type="coefficients", s=lambda.min)
+  nonZero.train <- sparsemat_to_df(coef.trainingMod)
+
+  #Use OS and EFS for test error metrics
+  y1 <- y
+  y2 <- c("Event.Free.Survival.Time.in.Days","Event.ID")
+  OS.form <- function(response,covariate){ as.formula(paste0("Surv(", response[1],"/365.25", ",",response[2], ")~ ",covariate))}
+
+  #update the test set based on the trained model.
+  test.data <- test.data %>%
+    rownames_to_column("USI") %>%
+    dplyr::select(nonZero.train$gene, everything(), -one_of(setdiff(x, nonZero.train$gene))) %>%
+    #apply the score calculation
+    mutate(LSC.Score=apply(t(dplyr::select(., nonZero.train$gene)), 2,
+           function(x) sum(x*nonZero.train$coef))) %>%
+    mutate(LSC.Median.Groups=factor(ifelse(LSC.Score >= median(LSC.Score), "high", "low"),
+                                    levels=c("low", "high"))) %>%
+    arrange(LSC.Score)
+
+  #Examine how the model score delineates risk groups.
+  error.metrics <- test.data %>%
+    do(cox.OSmedianGroups=coxph(OS.form(y1, "LSC.Median.Groups"), data = .),
+       cox.EFSmedianGroups=coxph(OS.form(y2, "LSC.Median.Groups"), data = .),
+
+       cox.OScontinuous=coxph(OS.form(y1, "LSC.Score"), data = .),
+       cox.EFScontinuous=coxph(OS.form(y2, "LSC.Score"), data = .),
+
+       KM.OS=SurvivalPlot(survfit(OS.form(y1, "LSC.Median.Groups"), data=.), #survival plots
+                         LegendTitle = "OS",
+                         timeUnit = "Years",
+                         colors = c("high"="red", "low"="dodgerblue")),
+       KM.EFS=SurvivalPlot(survfit(OS.form(y2, "LSC.Median.Groups"), data=.),
+                          LegendTitle="EFS",
+                          timeUnit= "Years",
+                          colors= c("high"="red", "low"="dodgerblue")))
+
+
+  #Fit the full dataset. #Not needed use the coeficients from the training set. 
+  # fullset <- as.matrix(df[,c(x,y)])
+  # final <- glmnet(fullset[,x], fullset[,y],family = "cox",
+  #                 standardize = standardize, lambda = grid)
+
+
+  #Extract the coefficients
+  coef <- predict(final, type="coefficients", s=lambda.min)
+  nonZero <- sparsemat_to_df(coef)
+
+
+  list <- list(train.data, test.data, mod,
+               cv.lambda, pred.outcome,error.metrics,
+               final,coef,nonZero)
+  names(list) <- c("training.set", "testing.set","train.model",
+                   "cv.lambda", "predicted.outcome", "test.error",
+                   "final.model", "coef","nonZeroCoef")
+
+  return(list)
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

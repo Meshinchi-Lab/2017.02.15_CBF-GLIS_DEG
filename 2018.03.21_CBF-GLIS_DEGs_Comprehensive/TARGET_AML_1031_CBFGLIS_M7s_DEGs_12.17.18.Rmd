@@ -1,0 +1,254 @@
+---
+title: "CBFGLIS and M7 Morphology DE Analysis"
+author: "Jenny Smith"
+date: "December 17, 2018"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', 
+                      fig.height=10, fig.width=10)
+knitr::opts_knit$set(root.dir = '~/RNA_seq_Analysis/2018.03.21_CBF-GLIS_DEGs_Comprehensive/')
+options(stringsAsFactors = FALSE)
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+library(tibble)
+library(tidyr)
+getwd()
+```
+
+```{r}
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/DifferentialExpressionPipeline_7.05.18.r")
+```
+
+
+#The Requests
+
+From Thomas Mercher
+
+1-CBFA2T3-GLIS2 (all patients) vs. All other pediatric AML (*DONE*)
+2-CBFA2T3-GLIS2 AMKL  patients vs. All other pediatric AML except the CBFA2T3-GLIS2 patients with other AML
+3-CBFA2T3-GLIS2 patients with other AML vs. All other pediatric AML except the CBFA2T3-GLIS2 patients with AMKL
+4-CBFA2T3-GLIS2 AMKL  patients vs. CBFA2T3-GLIS2 patients with other AML
+
+and if you have…
+5-CBFA2T3-GLIS2 AMKL  patients vs. Normal progenitors (are these adult bone marrow or cord blood normal progenitors?)
+6-CBFA2T3-GLIS2 AML  patients vs. Normal progenitors
+
+
+
+#Read in the Clinical Data
+
+```{r}
+CDE <- read.csv("~/reference_mapping-files/TARGET_AML_0531_1031_merged_CDEs_10.29.18.csv") %>%
+  mutate(CBFA2T3.GLIS2=gsub("Intermediate","Yes",CBFA2T3.GLIS2))
+
+head(CDE[,1:5])
+dim(CDE)
+```
+
+```{r}
+table(CDE$M7_AML, CDE$CBFA2T3.GLIS2)
+```
+
+
+```{r}
+#to define columns per the request, any patients to be excluded will be coded as "unknown" simply so they are fitlered out of the DE analysis
+
+CDE <- CDE %>%
+  mutate(M7.CBFGLIS=case_when(
+    M7_AML == "Yes" & CBFA2T3.GLIS2 == "Yes" ~ "M7.CBFGLIS", 
+    M7_AML != "Yes" & CBFA2T3.GLIS2 == "Yes" ~ "Unknown", #so that it is filtered out. Non-M7 CBFGLIS excluded from this analysis. 
+    TRUE ~ CBFA2T3.GLIS2), 
+    
+ nonM7.CBFGLIS= case_when(
+    M7_AML == "Yes" & CBFA2T3.GLIS2 == "Yes" ~ "Unknown", #so that it is filtered out. M7 CBFGLIS excluded from this analysis.
+    M7_AML == "Unknown" & CBFA2T3.GLIS2 == "Yes" ~ "Unknown", #there are 5 CBFLGIS who have unknown morphology. remove in case one is actaully M7 (though unlikely...)
+    M7_AML != "Yes" & CBFA2T3.GLIS2 == "Yes" ~ "nonM7.CBFGLIS",  
+    TRUE ~ CBFA2T3.GLIS2), 
+ 
+ M7.CBFGLISvsNonM7.CBFGLIS=case_when(
+    M7_AML == "Yes" & CBFA2T3.GLIS2 == "Yes" ~ "M7", 
+    M7_AML == "Unknown" & CBFA2T3.GLIS2 == "Yes" ~ "Unknown", #there are 5 CBFLGIS who have unknown morphology. remove in case one is actaully M7 (though unlikely...)
+    M7_AML != "Yes" & CBFA2T3.GLIS2 == "Yes" ~ "No",  
+    TRUE ~ "Unknown"), 
+ 
+ M7.CBFGLIS.Only=case_when(
+    M7_AML == "Yes" & CBFA2T3.GLIS2 == "Yes" ~ "M7.CBFGLIS", 
+    M7_AML != "Yes" & CBFA2T3.GLIS2 == "Yes" ~ "Unknown", #so that it is filtered out. Non-M7 CBFGLIS excluded from this analysis. 
+    TRUE ~ "Unknown")) %>%
+  
+  filter(!is.na(TARGET.USI.1)) %>%
+  set_rownames(.$TARGET.USI.1)
+  
+
+dim(CDE)
+```
+
+```{r}
+sapply(CDE[,177:180], table)
+```
+
+
+
+#Read in the Expression Data
+
+```{r}
+cts <- read.csv("~/RNA_seq_Analysis/0000.00.03_Expression_Matrices/TARGET_AML_AAML1031_dupGenesRemoved_FractionalCounts.csv", row.names = 1)
+colnames(cts) <- str_split_fixed(colnames(cts), "\\.", n=2)[,1]
+
+head(cts[,1:5])
+```
+
+
+
+#Differential Expression Analysis
+
+## versus Other AMLs
+
+```{r message=FALSE}
+pdf("TARGET_AML_1031_DEGs_TMercher_Heatmaps.pdf", height = 10, width = 10)
+DEGs <- lapply(colnames(CDE)[177:179],function(x) twoGroups_DEGs( 
+                    clinData=CDE,
+                    expnData = cts,
+                    col=x,
+                    ref="No",
+                    logCPM=FALSE,
+                    BM=FALSE,
+                    GOI=NULL,
+                    anno=FALSE,
+                    method="ward.D2"))
+
+dev.off()
+
+names(DEGs) <- colnames(CDE)[177:179]
+saveRDS(DEGs, "TARGET_AML_1031_CBFGLIS_DE_TM.RDS")
+```
+
+```{r}
+summary(DEGs)
+sapply(DEGs, function(x) table(x$phenovector))
+```
+
+```{r}
+M7.DEGs <- DEGs$M7.CBFGLIS
+nonM7.DEGs <- DEGs$nonM7.CBFGLIS
+M7vNon.GLIS <- DEGs$M7.CBFGLISvsNonM7.CBFGLIS
+```
+
+```{r}
+M7.DEGs.df <- extract_DEGs(M7.DEGs)
+nonM7.DEGs.df <- extract_DEGs(nonM7.DEGs)
+M7vNon.GLIS.df <- extract_DEGs(M7vNon.GLIS)
+
+dim(M7.DEGs.df) #3035    8
+dim(nonM7.DEGs.df) #3665    8
+dim(M7vNon.GLIS.df) #293 8
+
+# write.csv(M7.DEGs.df, "TARGET_AML_1031_M7.CBFGLIS_vs_OtherAMLs_12.18.18.csv", row.names = FALSE)
+# write.csv(nonM7.DEGs.df, "TARGET_AML_1031_nonM7.CBFGLIS_vs_OtherAMLs_12.18.18.csv",row.names = FALSE)
+# write.csv(M7vNon.GLIS.df, "TARGET_AML_1031_M7.CBFGLIS_vs_nonM7.CBFGLIS_12.18.18.csv",row.names = FALSE)
+```
+
+
+```{r fig.height=10, fig.width=14}
+grid.arrange(extract_PCA(M7.DEGs),
+    extract_MDS(M7.DEGs),
+    
+    extract_PCA(nonM7.DEGs),
+    extract_MDS(nonM7.DEGs),
+    
+    extract_PCA(M7vNon.GLIS),
+    extract_MDS(M7vNon.GLIS),ncol=2)
+```
+
+
+##Examine FCs of the M7.CBFGLIS to nonM7.CBFGLIS
+
+```{r fig.height=5, fig.width=5}
+# df <- M7.DEGs.df %>%
+#   inner_join(., nonM7.DEGs.df, by="gene")
+df <- data.frame(logFC=M7.DEGs$DE$eBayesFit$coefficients[,1]) %>%
+      rownames_to_column("Gene") %>%
+  inner_join(., data.frame(logFC=nonM7.DEGs$DE$eBayesFit$coefficients[,1], 
+                           Gene=names(nonM7.DEGs$DE$eBayesFit$coefficients[,1])), by="Gene")
+
+ggplot(df, aes(x=logFC.x, y=logFC.y)) +
+  geom_point() +
+  geom_smooth(method="lm",se = TRUE) +
+  theme_bw()
+```
+
+```{r}
+mod <- lm(logFC.x ~ logFC.y, data = df)
+summary(mod)
+```
+
+
+
+## versus NBMs
+
+```{r}
+# pdf("TARGET_AML_1031_M7.CBFGLSI_vs_NBM_TMercher_Heatmaps.pdf", height = 10, width = 10)
+DEGs.NBM <- twoGroups_DEGs( 
+                    clinData=CDE,
+                    expnData = cts,
+                    col="M7.CBFGLIS.Only",
+                    ref="No",
+                    logCPM=FALSE,
+                    BM=TRUE,
+                    GOI=NULL,
+                    anno=FALSE,
+                    method="ward.D2")
+# dev.off()
+```
+
+```{r}
+DEGs.NBM.df <- extract_DEGs(DEGs.NBM)
+
+
+dim(DEGs.NBM.df) #5213    8
+# write.csv(DEGs.NBM.df,"TARGET_AML_1031_M7.CBFGLIS_vs_NBM_12.18.18.csv", row.names = FALSE)
+```
+
+```{r}
+dim(DEGs.NBM$DE$Voom$E) #18,224 genes
+```
+
+```{r fig.height=5, fig.width=7}
+grid.arrange(extract_PCA(DEGs.NBM),
+    extract_MDS(DEGs.NBM))
+```
+
+
+
+#Compare Human DEGs to the Mouse Model DEGs 
+
+
+```{r}
+
+```
+
+
+
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+

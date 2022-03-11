@@ -1,0 +1,179 @@
+---
+title: "Demographics Analysis in CBFA2T3-GLIS2 AML"
+output: html_document
+date: "March 26, 2021"
+---
+
+# Set-up
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', message = FALSE, fig.width = 10, fig.height = 10)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,'2017.02.15_CBF-GLIS_DEG/'))
+options(stringsAsFactors = FALSE)
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(RColorBrewer)
+library(DeGSEA)
+getwd()
+```
+
+
+```{r}
+# source("~/scripts/survival_analysis/Survplot_Functions_2017.03.31.r")
+# source("~/scripts/survival_analysis/Survplot_Functions_2018.10.24.r")
+```
+
+# Read in the clinical Data 
+
+```{r}
+merged <- read.csv(file.path(CDE, "Merged/TARGET_AML_0531_1031_merged_CDEs_03.17.21.csv"))
+
+merged <- merged %>% 
+  filter(!is.na(USI), USI != "Unknown") %>%
+  filter(Eligibility_Comments != "remove") %>% 
+  mutate(CBFA2T3.GLIS2=case_when(
+    grepl("CBFA2T3.GLIS2", Primary.Fusion) ~ "Yes", 
+    ScreenedForFusion == "No" ~ "Unknown",
+    TRUE ~ "No")) %>%
+  mutate(AML=rep("AML", nrow(.))) %>% 
+  set_rownames(.$USI)
+
+
+head(merged[,1:5])
+dim(merged) #2217  146
+```
+
+```{r}
+table(merged$CBFA2T3.GLIS2)
+```
+
+
+
+# Clinical Characteristics Table and Plots
+
+```{r message=FALSE}
+library(compareGroups)
+```
+
+  mutate(EMD=gsub("\\.", "Unknown", EMD)) %>%
+  mutate(EMD.NotCNS3=case_when(
+    CNS == "CNS3" & EMD == "Yes" ~ "CNS.EMD+", 
+    CNS != "CNS3" & EMD == "Yes" ~ "EMD+", 
+    TRUE ~ EMD)) %>%
+    
+```{r}
+table(merged$Ethnic.Classification)
+```
+
+```{r}
+dat <- merged %>%
+  
+  select(CBFA2T3.GLIS2, 
+         Protocol, Age.Category, Age.in.years,
+         Sex, Ethnicity:rs12459419, 
+         EFS.event.type.ID, 
+         Cyto.Fusion.Molecular.Risk_update:Final.Risk.Group,
+         M6_AML:M7_AML) %>%
+  mutate(AmericanIndian_or_AlaskaNative=case_when(
+                  grepl("American Indian or Alaska Native", Ethnic.Classification) ~ "Yes", 
+                  Ethnic.Classification=="Unknown" ~ NA_character_,
+                  TRUE ~ "No"),
+         Asian=case_when(
+                grepl("Asian", Ethnic.Classification) ~ "Yes", 
+                Ethnic.Classification=="Unknown" ~ NA_character_,
+                TRUE ~ "No"),
+         Black_or_AfricanAmerican=case_when(
+          grepl("Black", Ethnic.Classification) ~ "Yes", 
+          Ethnic.Classification=="Unknown" ~ NA_character_,
+           TRUE ~ "No"),
+         Caucasian=case_when(
+           grepl("Caucasian", Ethnic.Classification) ~ "Yes", 
+           Ethnic.Classification=="Unknown" ~ NA_character_,
+           TRUE ~ "No"),
+         Hispanic=case_when(
+           grepl("Hispanic", Ethnic.Classification) ~ "Yes", 
+           Ethnic.Classification=="Unknown" ~ NA_character_,
+           TRUE ~ "No"),
+         MultipleRaces=case_when(
+           grepl("Multiple races", Ethnic.Classification) ~ "Yes", 
+           Ethnic.Classification=="Unknown" ~ NA_character_,
+           TRUE ~ "No"),
+         NativeHawaiian_or_PacificIslander=case_when(
+           grepl("Native Hawaiian", Ethnic.Classification) ~ "Yes", 
+           Ethnic.Classification=="Unknown" ~ NA_character_,
+           TRUE ~ "No"), 
+         Other=case_when(
+           grepl("Other", Ethnic.Classification) ~ "Yes", 
+           Ethnic.Classification=="Unknown" ~ NA_character_,
+           TRUE ~ "No")) %>% 
+  mutate_all(~ifelse(.=="Unknown", NA, .)) %>%
+  
+  # mutate(LessThan1yr=ifelse(Age.in.years < 1.0, "LessThan_1yr", "No"), 
+  #        age1yr=ifelse(Age.in.years >= 1.0 & Age.in.years < 2.0, "1yr_olds", "No"), 
+  #        age2yr=ifelse(Age.in.years >= 2.0 & Age.in.years < 3.0, "2yr_olds", "No"),
+  #        age3yr=ifelse( Age.in.years >= 3.0 & Age.in.years < 4.0, "3yr_olds", "No")) %>%
+  # 
+  mutate(Age.Category=factor(Age.Category, levels=c("Less than 3 years","Between 3 and 5 years",
+                                                    "Between 5 and 10 years","Between 10 and 18 years",
+                                                    "Greater than 18 years"))) %>% 
+  select(CBFA2T3.GLIS2:Ethnicity,
+         AmericanIndian_or_AlaskaNative:Other, 
+         everything(),
+         -Ethnic.Classification)
+
+dim(dat) #1761 patients
+colnames(dat)
+```
+
+```{r warning=FALSE} 
+comp <- compareGroups(CBFA2T3.GLIS2 ~ ., 
+                           method=4, 
+                           Q1=0, Q3=1, 
+                           ref.no="No",
+                           data = dat)
+```
+
+
+```{r}
+tab.all <- createTable(comp)
+
+# tab.all
+```
+
+```{r}
+gender_in_AA <- dat %>% 
+  filter(CBFA2T3.GLIS2 == "Yes", !is.na(Black_or_AfricanAmerican)) %>% 
+  group_by(Black_or_AfricanAmerican, Sex) %>% 
+  count() %>% 
+  ungroup() %>% 
+  spread(Sex, n) %>% 
+  as.data.frame() %>% 
+  set_rownames(.$Black_or_AfricanAmerican)  %>% 
+  select(-Black_or_AfricanAmerican)
+
+gender_in_AA
+
+chisqr <- chisq.test(gender_in_AA)
+
+chisqr
+
+chisqr$expected
+chisqr$observed
+```
+
+
+```{r}
+# export2word(tab.all, "TARGET_AML_0531_1031_CBFGLIS_ClinChars_Table.docx")
+# export2xls(tab.all,"TARGET_AML_0531_1031_CBFGLIS_Demographics_Table.xlsx")
+```
+
+
+

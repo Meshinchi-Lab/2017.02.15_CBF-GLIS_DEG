@@ -1,0 +1,297 @@
+---
+title: 'miRNA-mRNA Interactions in CBFLGIS'
+author: "Jenny Smith"
+date: "November 16, 2018"
+output: html_document
+---
+
+#Set-up 
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height=5, fig.width=8)
+knitr::opts_knit$set(root.dir = '~/RNA_seq_Analysis/2018.03.21_CBF-GLIS_DEGs_Comprehensive/')
+options(stringsAsFactors = FALSE)
+```
+
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(multiMiR, lib.loc = "~/R/x86_64-pc-linux-gnu-library/3.5/")
+getwd()
+```
+
+
+#Define Functions 
+
+
+```{r}
+reformat_ints <- function(multimir.res, gene.miR.corrs, DEGs, DEMirs, type="summary"){
+  
+  if(type=="summary"){
+     reformatted <- multimir.res@summary %>%
+       filter(all.sum >= 2 | validated.sum > 0) #maybe should skip this step. Too stringent.....
+     
+  }else if (type=="data"){
+     reformatted <- Up.Gene.Ints@data
+  }
+  
+  reformatted <- reformatted %>%
+    inner_join(., dplyr::select(gene.miR.corrs,
+                      Mir.V.21,
+                      Gene, 
+                      SpearmanRho, 
+                      adj.P.Val_Corr=Adj.P.val),
+            by=c("mature_mirna_id"="Mir.V.21",
+                 "target_symbol"="Gene")) %>%
+    left_join(., dplyr::select(DEGs,
+                      gene,
+                      logFC_Gene=logFC,
+                      adj.P.Val_Gene=adj.P.Val,
+                      contains("Compartment")),
+            by=c("target_symbol"= "gene")) %>%
+    left_join(., dplyr::select(DEMirs,
+                      miR,
+                      logFC_miRNA=logFC,
+                      adj.P.Val_miRNA=adj.P.Val,
+                      gene),
+            by=c("mature_mirna_id"= "miR")) %>%
+    dplyr::select(mature_mirna_acc, mature_mirna_id,logFC_miRNA,adj.P.Val_miRNA,
+         target_symbol,logFC_Gene,adj.P.Val_Gene,
+         SpearmanRho, adj.P.Val_Corr,
+         everything())
+  
+  return(reformatted)
+  
+}
+```
+
+
+
+#Read in the Clinical Data
+
+```{r}
+CDE.1031 <- read.csv("~/reference_mapping-files/AAML1031_Target_CDEs_with_HiAR_and_PrimaryCyto_withFusionCalls_10.11.2018.csv")
+
+
+CDE.1031 <- CDE.1031 %>%
+  filter(!is.na(USI)) %>%
+  set_rownames(.$USI)
+
+
+head(CDE.1031[,1:5])
+```
+
+#Read in the DE Results
+
+```{r}
+DEMirs <- read.csv("DEMirs/TARGET_AML_1031_CBFGLIS_vs_OtherAML_DEMirs_10.29.18.csv")
+
+dim(DEMirs)
+head(DEMirs)
+```
+
+
+```{r}
+DEGs.1031 <- read.csv("DEGs/TARGET_AML_1031_CBFGLIS_vs_OtherAML_DEGs_updateAnno.csv")
+
+dim(DEGs.1031)
+```
+
+
+#Read in the Correlation Data 
+
+```{r}
+UpGenePairs <- read.csv("miRNA-mRNA_Interactions/TARGET_AML_1031_CBFGLIS_vs_OtherAML_UpGenes_DnMirs_antiCorrs.csv")
+
+head(UpGenePairs)
+dim(UpGenePairs) # 452   7
+```
+
+```{r}
+DnGenePairs <- read.csv("miRNA-mRNA_Interactions/TARGET_AML_1031_CBFGLIS_vs_OtherAML_DnGene_UpMirs_antiCorrs.csv")
+
+head(DnGenePairs)
+dim(DnGenePairs)
+```
+
+
+#Use MultiMir to Query Databases
+
+- default is to query validated targets 
+- table = "predicted" for predicted interactions
+
+```{r}
+multimir_dbInfoVersions()
+```
+
+```{r}
+#ensure using the most up to date database version
+multimir_switchDBVersion(db_version = "2.2.0")
+```
+
+```{r}
+#mirTarbase is still out of date. I will need to manually supplement this in  my pipeline. 
+multimir_dbInfo()
+```
+
+```{r warning=FALSE, message=FALSE}
+Up.Gene.Ints <- get_multimir(org="hsa", 
+                           mirna = UpGenePairs$Mir.V.21,
+                           target = UpGenePairs$Gene,
+                           table = "all", 
+                           summary = TRUE, 
+                           predicted.cutoff = Inf, #no filter
+                           predicted.cutoff.type = "n", 
+                           use.tibble = TRUE)
+
+```
+
+```{r}
+table(Up.Gene.Ints@data$type)
+dim(Up.Gene.Ints@summary) #2203 total interactions
+# saveRDS(Up.Gene.Ints, "TARGET_AML_1031_CBFGLIS_vs_OtherAMLs_UpGenes_DnMirs_multimir.RDS")
+```
+
+
+```{r warning=FALSE, message=FALSE}
+Dn.Gene.Ints <- get_multimir(org="hsa", 
+                           mirna = DnGenePairs$Mir.V.21,
+                           target = DnGenePairs$Gene,
+                           table = "all", 
+                           summary = TRUE, 
+                           predicted.cutoff = Inf, 
+                           predicted.cutoff.type = "n", 
+                           use.tibble = TRUE)
+```
+
+```{r}
+table(Dn.Gene.Ints@data$type)
+dim(Dn.Gene.Ints@summary) # 12, 139 
+# saveRDS(Dn.Gene.Ints, "TARGET_AML_1031_CBFGLIS_vs_OtherAMLs_DnGenes_UpMirs_multimir.RDS")
+```
+
+
+
+#Reformat the results
+
+```{r}
+Up.Gene.Ints_fmt <- reformat_ints(multimir.res = Up.Gene.Ints, 
+                                  gene.miR.corrs = UpGenePairs, 
+                                  DEGs=DEGs.1031,
+                                  DEMirs=DEMirs) #%>%
+  # mutate(Pairs=paste(mature_mirna_id, target_symbol, sep="_"))
+
+
+# head(Up.Gene.Ints_fmt) 
+dim(Up.Gene.Ints_fmt) #39 interactions. 2 less than the anamiR results.... 
+# write.csv(Up.Gene.Ints_fmt, "TARGET_AML_1031_CBFGLIS_vs_OtherAMLs_UpGenes_DnMirs_multimir.csv", row.names = FALSE)
+```
+
+```{r}
+Up.Gene.FullData <- reformat_ints(multimir.res = Up.Gene.Ints,
+                                  gene.miR.corrs = UpGenePairs,
+                                  DEGs=DEGs.1031, 
+                                  DEMirs = DEMirs, 
+                                  type = "data")
+
+dim(Up.Gene.FullData) # 2177   22
+
+
+head(Up.Gene.FullData)
+```
+
+```{r}
+Dn.Gene.Ints_fmt <- reformat_ints(multimir.res = Dn.Gene.Ints, 
+                                  gene.miR.corrs = DnGenePairs, 
+                                  DEGs=DEGs.1031, 
+                                  DEMirs=DEMirs) #%>%
+  # mutate(Pairs=paste(mature_mirna_id, target_symbol, sep="_"))
+
+
+
+# head(Dn.Gene.Ints_fmt) 
+dim(Dn.Gene.Ints_fmt) #1180 interactions. 506 less than the anamiR results.... 
+# write.csv(Dn.Gene.Ints_fmt, "TARGET_AML_1031_CBFGLIS_vs_OtherAMLs_DnGenes_UpMirs_multimir.csv", row.names = FALSE)
+```
+
+
+Ultimately, anamiR is the superiour package for finding interactions. However, it is NOT maintained anymore and will not be updated any point... SO I may use both, but even multiMiR that is actively maintained is fairly out of date....
+
+
+
+
+#Examine NCAM1 interactions 
+
+
+```{r}
+load(url("http://multimir.ucdenver.edu/bladder.rda"))
+```
+
+```{r}
+NCAM1.ints <- get_multimir(org="hsa", 
+                           # mirna = NCAM1$Mir.V.21,
+                           mirna = "hsa-miR-378a-5p",
+                           target = "ENSG00000149294",
+                           table = "all", 
+                           summary = TRUE, 
+                           predicted.cutoff = 500000, 
+                           predicted.cutoff.type = "n", 
+                           use.tibble = TRUE)
+
+
+```
+
+```{r}
+table(NCAM1.ints@data$type)
+```
+
+```{r}
+dim(NCAM1.ints@data)
+
+head(NCAM1.ints@data)
+write.csv(NCAM1.ints@data, "~/test.csv", row.names = FALSE)
+```
+
+```{r}
+quantile(NCAM1.ints@data$score, na.rm=TRUE)
+```
+
+```{r}
+NCAM1.ints@summary
+```
+
+```{r}
+corr <- filter(UpGenePairs.all, Gene == "NCAM1") %>%
+  dplyr::select(Adj.P.val.Corr=Adj.P.val, everything())
+
+head(corr)
+range(corr$Adj.P.val.Corr)
+range(corr$SpearmanRho)
+```
+
+```{r}
+NCAM1.ints.DE <- NCAM1.ints@summary %>%
+  filter(mature_mirna_acc %in% DEMirs$MIMAT) %>%
+  inner_join(., DEMirs, by=c("mature_mirna_acc"="MIMAT")) %>%
+  left_join(., corr, by=c("mature_mirna_acc"="MIMAT")) %>%
+  dplyr::select(mature_mirna_acc, mature_mirna_id, target_symbol, logFC, adj.P.Val,SpearmanRho, Adj.P.val.Corr, everything())
+
+
+dim(NCAM1.ints.DE)
+head(NCAM1.ints.DE)
+write.csv(NCAM1.ints.DE, "TARGET_AML_CBFGLIS_NCAM1_miRNA.mRNA.csv", row.names = FALSE)
+```
+
+
+#Session Information 
+
+```{r}
+sessionInfo()
+```
+

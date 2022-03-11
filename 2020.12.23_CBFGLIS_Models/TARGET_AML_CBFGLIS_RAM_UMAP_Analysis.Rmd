@@ -1,0 +1,473 @@
+---
+title: "UMAP Clustering of Ribodepleted RNA-seq for CBGLIS and RAM phenotype"
+author: "Jenny Smith, Scott Furlan"
+date: "1/12/20"
+output: html_document
+---
+
+#Set-up
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2017.02.15_CBF-GLIS_DEG/2020.12.23_CBFGLIS_Models/"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+options(stringsAsFactors = FALSE,bitmapType = 'cairo', device='x11')
+grDevices::X11.options(type='cairo')
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message=FALSE}
+library(ggplot2)
+library(ggrepel)
+library(viridis)
+library(scales)
+library(RColorBrewer)
+
+
+library(dplyr)
+library(magrittr)
+library(tibble)
+library(tidyr)
+library(DeGSEA)
+
+getwd()
+```
+
+
+#Read in the Clinical Data
+
+```{r message=FALSE, warning=FALSE}
+merged <- readr::read_csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_03.17.21.csv"))
+
+merged <- merged %>%
+  filter(USI != "Unknown", !is.na(USI))
+
+ineligable <- filter(merged, Eligibility_Comments == "remove") %>% 
+  pull(USI)
+
+dim(merged) #2314  145
+
+# table(merged$RAM.phenotype) #, merged$Primary.Fusion=="CBFA2T3-GLIS2")
+```
+
+```{r}
+# filter(merged, RAM.phenotype=="Yes") %>% 
+#   dplyr::select(USI, Primary.Fusion,RAM.phenotype) %>% 
+#   arrange(desc(Primary.Fusion))
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET,"SequencingDataMatrix/00_Archive/TARGET_AML_Ribodepleted_Manifest_10.08.20.csv")) %>%
+  left_join(., dplyr::select(merged, USI, RAM.phenotype), 
+            by="USI")  %>% 
+  mutate_at(vars(RAM.phenotype), ~ifelse(is.na(.), Group, .)) %>% 
+  mutate_at(vars(AML_Subtype), ~ifelse(. !="CBFA2T3-GLIS2" & RAM.phenotype == "Yes", "RAM+/CBFGLIS-", .)) %>%
+  filter(!USI %in% ineligable)
+  
+dim(sample_info) #2646   14
+# head(sample_info[,1:5])
+
+# table(sample_info$RAM.phenotype)
+table(sample_info$AML_Subtype)
+```
+
+```{r}
+CBFGLIS.models <- read.csv("TARGET_AML_CBFGLIS_CordBlood_Models_Sample_Conditions.csv")
+
+# head(CBFGLIS.models)
+dim(CBFGLIS.models) #50 56
+# View(CBFGLIS.models)
+table(CBFGLIS.models$Protocol)
+```
+
+```{r}
+CBFGLIS_samples <- CBFGLIS.models %>%  
+  filter(grepl("CordBlood", AML_Subtype), !grepl("sort", Sample)) %>%
+  bind_rows(., filter(sample_info, grepl("diagnostic|NBM|CD34", Time_point))) %>% 
+  left_join(.,dplyr::select(merged, USI, M7_AML,
+                     BM.blasts=Bone.marrow.leukemic.blast.percentage....),
+            by="USI") %>% 
+  mutate_at(vars(c("Time_point","Time_Point_Group","Culture_condition",
+                   "Transduction_condition","M7_AML")), 
+            ~case_when(
+              is.na(.) ~ AML_Subtype,
+              TRUE ~ .)) %>% 
+  
+  mutate(Comparisons=case_when(
+    Protocol=="CordBlood" ~ paste(Culture_condition, Time_Point_Group, AML_Subtype, sep="_"), 
+    TRUE ~ AML_Subtype)) %>% 
+    # TRUE ~ AML_Subtype) %>%
+  # mutate(Comparisons=gsub("^(CBFA2T3.GLIS2|NBM|CD34_PB)_.+", "\\1", Comparisons)) %>% 
+  
+  mutate(USI1=USI,
+         USI=Sample) %>% 
+  arrange(AML_Subtype) %>% 
+  set_rownames(.$Sample)
+
+
+
+dim(CBFGLIS_samples) 
+# head(CBFGLIS_samples[,1:5])
+# View(CBFGLIS_samples)
+# table(CBFGLIS_samples$Comparisons)
+table(CBFGLIS_samples$Group)
+# table(CBFGLIS_samples$Protocol)
+```
+
+
+# Read in Counts Data
+
+```{r}
+#BCCA
+rbd_counts <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/TARGET_AML_MPN_DS_NBM_2646Samples_Ribodepleted_RNAseq_geneLevel_dupGenesRemoved_FractionalCounts.RDS")) %>% 
+  column_to_rownames("Gene")
+
+
+dim(rbd_counts) #51573  2418
+head(rbd_counts[,1:5])
+```
+
+```{r}
+#Kallisto work horribly with this UMAP pipeline right now. WTF 
+cts.symbols <- readRDS("Expression_Data/TARGET_AML_CBFGLIS_Models_Kallisto_Quant_GeneLevel_dupGenesRemoved_scaledTPM_counts.RDS")
+
+#convert to data.frame from tibble
+cts.symbols <- as.data.frame(cts.symbols)
+
+#keep annotated genes-geneID mapping as a referecne file
+cts.symbols <- cts.symbols[grep("^ENSG", cts.symbols$gene_id), ]
+cts.symbols.IDs <- cts.symbols[,c(1:2)]
+
+#Set rownames
+rownames(cts.symbols) <- cts.symbols$gene_name
+cts.symbols <- cts.symbols[,-c(1:2)]
+
+
+dim(cts.symbols) #57133  2166
+head(cts.symbols[,1:5])
+```
+
+
+# Select input samples and Filter Low read counts
+
+```{r}
+include_samples <- sample_info %>%  #CBFGLIS_samples %>% 
+    # filter(grepl("EC_Week1_GFP|EC_Week(1|7|12)_CBFGLIS|Myeloid_Week1_GFP|Myeloid_Week(1|7)_CBFGLIS",Comparisons) | 
+    #          grepl("diagnostic|NBM|CD34_PB", Time_point)) %>% 
+  
+  filter(grepl("diagnostic|NBM|CD34_PB", Time_point)) %>% 
+
+  filter(Sample %in% colnames(rbd_counts)) %>% 
+  left_join(., dplyr::select(merged,-one_of(c("Protocol","Primary.CNV","Additional.Fusions.CNV",
+                                               "Primary.Fusion","Group","Reg.")), 
+                                      -matches("^RAM")),
+            by="USI") %>%
+  mutate(AML_Subtype.Simple = ifelse(grepl("NUP98", AML_Subtype), "NUP98", AML_Subtype)) %>%
+
+
+  filter(!grepl("AML|No.Primary.Fusion|DS|TMD|MPN|RBM15-MKL1", AML_Subtype)) %>%
+  as.data.frame() %>%
+  set_rownames(.$Sample)
+
+head(include_samples)
+dim(include_samples) 
+```
+
+```{r}
+filter(include_samples,AML_Subtype.Simple== "RAM+/CBFGLIS-") %>% 
+  select(Sample, RAM.phenotype, Primary.Fusion)
+```
+
+
+```{r}
+table(include_samples$AML_Subtype.Simple) %>%  length()
+# table(include_samples$Time_point)
+table(include_samples$AML_Subtype.Simple)
+# table(include_samples$Comparisons)
+```
+
+
+```{r}
+AML <- !grepl("BM[0-9]|R[O0][0-9]", colnames(rbd_counts))
+#minimun number of samples in AML_Subtype
+keep <- rowSums(rbd_counts[AML, include_samples$Sample] >= 10) >= 10 
+in_counts <- as.matrix(rbd_counts[keep, include_samples$Sample]) 
+
+dim(in_counts)  
+head(in_counts[,1:5])
+```
+
+
+#Colors for Plotting
+
+```{r fig.height=2}
+colors37 = c("#466791","#60bf37","#953ada","#4fbe6c","#ce49d3","#a7b43d","#5a51dc","#d49f36","#552095","#507f2d","#db37aa","#84b67c","#a06fda","#df462a","#5b83db","#c76c2d","#4f49a3","#82702d","#dd6bbb","#334c22","#d83979","#55baad","#dc4555","#62aad3","#8c3025","#417d61","#862977","#bba672","#403367","#da8a6d","#a79cd4","#71482c","#c689d0","#6b2940","#d593a7","#895c8b","#bd5975")
+# barplot(rep(1,37), col=colors37, names.arg = colors37, las=2)
+```
+
+```{r fig.height=4, fig.width=7}
+Cols <- c("Group", "Tissue", "Protocol", "AML_Subtype.Simple", "Batch")
+df <- include_samples %>% 
+  dplyr::select(all_of(Cols))
+
+#make color codes
+cc <- colorCodes_aheatmap(df=df)
+cc <- lapply(cc, function(x) {x["CD34_PB"] <- "grey80"; return(x)})
+
+cc$AML_Subtype.Simple["RAM+/CBFGLIS-"] <- "orchid1"
+cc$AML_Subtype.Simple["DEK-NUP214"] <- "forestgreen"
+# cc$AML_Subtype.Simple[!grepl("CD34_PB|NBM",cc$AML_Subtype.Simple)]
+
+par(mar=c(8,8,8,8))
+barplot(rep(1,length(cc$AML_Subtype.Simple)),
+        col = cc$AML_Subtype.Simple,
+        names.arg = names(cc$AML_Subtype.Simple),
+        las=2)
+```
+
+
+# UMAP Projection 
+
+```{r}
+sample_total <- apply(in_counts, 2, sum)
+geomean <- exp(mean(log(sample_total)))
+sf <- sample_total/geomean
+sf.scaled <- t(t(in_counts)/sf)
+
+dim(sf.scaled)
+```
+
+
+## TF-IDF 
+
+```{r}
+TFIDF <-  as.matrix(seqGlue::tf_idf_transform(sf.scaled))
+
+
+head(TFIDF[,1:5])
+dim(TFIDF) 
+# range(TFIDF)
+
+# write.csv(as.matrix(TFIDF),"TARGET_AML_dx_rlps_NBM_TFIDF.csv")
+```
+
+
+## Input Feature selection 
+
+NOTE: add a jackstraw PCA here
+
+```{r message=FALSE}
+library(DelayedArray)
+# Mean vs Dispersion Feature Selection 
+disp_trend_obj <- seqGlue::calc_dispersion(sf.scaled, 
+                                  removeOutliers = TRUE) #removes outlier 
+
+input_genes <- seqGlue::get_selected_genes(seqGlue::select_genes(disp_trend_obj, top_n=NULL))
+length(input_genes) #7154
+```
+
+```{r}
+jackstraw.res <- run_jackstraw(log2(sf.scaled[input_genes,]+1))
+
+
+length(jackstraw.res$input_features) #6923
+# jackstraw.res$N_comp
+# saveRDS(jackstraw.res,"TARGET_AML_CBFLIS_Models_RAM_jackstraw_PCA.RDS")
+```
+
+
+## Run the workflow
+
+```{r}
+table(include_samples$AML_Subtype.Simple)
+# cc$AML_Subtype.Simple
+```
+
+```{r}
+#columns to use for plotting
+Cols <- c("Group", "Tissue", "Protocol", "AML_Subtype.Simple", "Batch")
+
+#n_neighbors:  Larger values result in more global views of the manifold, while smaller values result in more local data being preserved.
+
+#min_dist: Smaller values will result in a more clustered/clumped embedding where nearby points on the manifold are drawn closer together, while larger values will result on a more even dispersal of points.
+
+dx_umap <- UMAP_workflow(TFIDF_Matrix = TFIDF,
+                              input_features = jackstraw.res$input_features,
+                              samples_vector = pull(include_samples, Sample), 
+                              sample_info_df = include_samples, 
+                              cc = cc, 
+                              min_dist = 0.05,
+                              n_neighbors = 25,
+                              k2=10,
+                              res2 = 0.001,
+                              scale_data = FALSE,
+                              Columns_for_Plots = Cols,
+                              addl_color_vector = colors37)
+```
+
+
+```{r fig.height=10, fig.width=10}
+dx_umap$umap_2D_scatter
+```
+
+```{r}
+# dx_rlps_umap$cluster_plots1
+# dx_umap$cluster_plots2
+```
+
+```{r}
+# dx_rlps_umap$cluster_KM1$OS_KM
+table(dx_rlps_umap$outcome_df1$Major_vs_minor_Subtype_in_Cluster,
+      dx_rlps_umap$outcome_df1$cluster)
+```
+
+
+# Figures 
+
+```{r}
+res <- dx_rlps_umap$umap_res %>%
+  mutate_at(vars(Subtype_Time_point),~factor(.,levels=group.order)) %>% 
+  left_join(., data.frame(Colors=cc$Subtype_Time_point) %>%
+              rownames_to_column("Subtype_Time_point"),
+            by="Subtype_Time_point")
+# head(res)
+
+table(res$Subtype_Time_point)
+```
+
+```{r}
+# install.packages("scatterplot3d") # Install
+library("scatterplot3d")
+```
+
+```{r fig.height=7}
+input <- filter(res, !grepl("CD34", Subtype_Time_point))
+scatterplot3d(input[,c("x","y","z")], pch = 16, 
+              color=alpha(pull(input,Colors), 0.7),
+              cex.axis=4.0,cex.symbols=2.0)
+```
+
+
+
+### 3D Plot.ly 
+
+```{r message=FALSE}
+library(plotly)
+```
+
+```{r}
+hover_info <- c("Sample", "Primary.Fusion","Age.in.years","EFS.event.type.ID",
+                "Time_point","Overlap.Mutation.Info", "Additional.Fusions.CNV")
+info_df <- dplyr::select(include_samples,all_of(hover_info)) %>%
+  mutate_if(is.numeric, ~round(., digits=2))
+
+
+info <- gather(info_df,"Col","Value",-Sample) %>%
+  mutate_at(vars(Value), ~paste(Col, ": ", .)) %>%
+  spread(Col, Value) %>%
+  unite("hover_statement",sep="\n",na.rm = T)  %>%
+  pull(hover_statement)
+
+
+# head(info)
+# tail(info)
+```
+
+```{r fig.width=16}
+textcol <- rgb(0,0,0)
+bgcol <- rgb(1,1,1)
+Group_Col <- "AML_Subtype.Simple"
+
+p.dx <- plot_ly() %>% 
+  #plot diagnostic and normal samples
+  add_trace(data=dx_umap$umap_res,
+            x = ~x, y = ~y, z = ~z,
+            color = as.formula(paste0("~", Group_Col)),
+            colors = cc[[Group_Col]],
+            type='scatter3d',
+            mode='markers',
+            text=info,
+            hoverinfo='text',
+            showlegend=TRUE,
+            marker=list(size=4.5,
+                        opacity=0.5),
+                        # line=list(color=col2hex("grey80"),
+                        #           width=0.25)),
+            # line=list(size=1, color=col2rgb("grey80")),
+            inherit = TRUE) %>%
+  # title=list(text="Pediatric AML Clustering By Gene Expression",
+  #font = list(color=textcol,size=30)
+  layout(scene = list(xaxis = list(title = 'UMAP_1',
+                                   color=textcol,
+                                   size=14,
+                                   backgroundcolor=bgcol,
+                                   showbackground=TRUE,
+                                   showgrid=TRUE,
+                                   gridcolor=textcol,
+                                   tickcolor=textcol),
+                     yaxis = list(title = 'UMAP_2',
+                                  color=textcol,
+                                  size=14,
+                                  backgroundcolor=bgcol,
+                                  showbackground=TRUE,
+                                  showgrid=TRUE,
+                                  gridcolor=textcol,
+                                  tickcolor=textcol),
+                     zaxis = list(title = 'UMAP_3',
+                                  color=textcol,
+                                  size=14,
+                                  backgroundcolor=bgcol,
+                                  showbackground=TRUE,
+                                  showgrid=TRUE,
+                                  gridcolor=textcol,
+                                  tickcolor=textcol)),
+      
+         legend=list(font=list(size=20, color=textcol),
+                     itemsizing="trace", 
+                     bgcolor=bgcol,
+                     bordercolor=textcol,
+                     borderwidth=2),
+         plot_bgcolor=bgcol,
+         paper_bgcolor=bgcol)
+ 
+p.dx
+
+# saveRDS(p.dx, "TARGET_AML_CBFGLIS_RAM_dx_NBM_plotly_object.RDS")
+```
+
+```{r}
+# install.packages("processx")
+# orca(p.dx,"dx_rlps_3dscatter.pdf", format = "pdf")
+```
+
+```{r}
+htmlwidgets::saveWidget(as_widget(p.dx),
+                        "TARGET_AML_CBFGLIS_RAM_dx_NBM_plotly_3Dscatter.html",
+                        selfcontained = TRUE,
+                        background = bgcol,
+                        knitrOptions = list(dpi=1200,
+                                            fig.height = 15,
+                                            fig.width=15,
+                                            out.width=15,
+                                            out.height=15))
+```
+
+
+
+
+
+
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+
