@@ -10,6 +10,11 @@ output: html_document
 
 ```{r setup, cache = FALSE, include = FALSE}
 require(knitr)
+PROJHOME  <- if(grepl("gizmo",  Sys.info()[["nodename"]])){
+  file.path("/fh/fast/meshinchi_s/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis")
+}else{
+  file.path("~/fast_drive/workingDir/TARGET/AML_TARGET/RNA/mRNAseq/analysis")
+}
 knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2017.02.15_CBF-GLIS_DEG/2020.12.23_CBFGLIS_Models"))
 ```
 
@@ -1890,17 +1895,14 @@ my_comparisons <- list(c("EC_Week1_GFP_CordBlood", "EC_Week1_CBFGLIS_CordBlood")
                        c("NBM","CBFA2T3-GLIS2"))
 
 
-# ggplot(data=genes.of.interest, aes(x=Comparisons, y=CPM, fill=Comparisons)) +
-#       geom_boxplot(alpha=0.2,outlier.shape = NA,  inherit.aes = TRUE)  +
-#   stat_compare_means(comparisons = my_comparisons, method="wilcox.test", 
-#                      method.args = list(alternative="two.sided"), 
-#                      label="p.signif") + #"p.signif"
-#   facet_wrap(~gene) +
-#   theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1))
+ggplot(data=genes.of.interest, aes(x=Comparisons, y=CPM, fill=Comparisons)) +
+      geom_boxplot(alpha=0.2,outlier.shape = NA,  inherit.aes = TRUE)  +
+  stat_compare_means(comparisons = my_comparisons, method="wilcox.test",
+                     method.args = list(alternative="two.sided"),
+                     label="p.signif") + #"p.signif"
+  facet_wrap(~gene) +
+  theme(axis.text.x = element_text(angle=25, vjust=1, hjust=1))
 ```
-
-
-
 
 ```{r}
 DEGs.list.objs <- ls(pattern = "DEGs.EC|DEGs.MC")
@@ -3511,19 +3513,16 @@ head(MFI)
 ```
 
 ```{r}
-range(MFI$MFI_FC)
-```
-
-```{r fig.height=5, fig.width=4.5}
 # pdf("TARGET_AML_FoldChange_MFI_FOLR1_boxplot.pdf", height = 5, width = 4.5)
 ggplot(MFI, aes(x=Cell_Type, y=MFI_FC, fill=Cell_Type, color=Cell_Type)) +
-  geom_boxplot(alpha=0.3) +
+  # geom_boxplot(alpha=0.3) +
   geom_point(position =   ggbeeswarm::position_quasirandom()) +
   scale_fill_manual(values=c("AML"="dodgerblue4", "Lymph"="black", "Mono"="grey50", "Myeloid"="grey80"),
                     labels=c("AML"="CBFA2T3-GLIS2", "Lymph"="Lymphocytes","Mono"="Monocytes", "Myeloid"="Myeloid")) +
   scale_color_manual(values=c("AML"="dodgerblue4", "Lymph"="black", "Mono"="grey50", "Myeloid"="grey80"),
                     labels=c("AML"="CBFA2T3-GLIS2", "Lymph"="Lymphocytes","Mono"="Monocytes", "Myeloid"="Myeloid")) +
   scale_x_discrete(labels=c("AML"="CBFA2T3-GLIS2", "Lymph"="Lymphocytes","Mono"="Monocytes", "Myeloid"="Myeloid")) +
+  # scale_y_continuous(trans = scales::log1p_trans()) +
   labs(y="Fold-Change MFI [AML/Normal]", x="Cell Type") +
   theme_classic() +
     theme(axis.text.x = element_text(size=10, color="black", angle=10, vjust=1, hjust=1),

@@ -1,0 +1,23 @@
+# Jenny Smith
+# Oct 16, 2022
+
+
+
+# 19 AUTHOR: Please specify the values for the box-and-whisker plots in B [the bounds of the boxes, the lines within the boxes, the whiskers, and any outlying values]. If this description applies to all box-and-whisker plots throughout, then this can be added to the Statistics section.)
+
+Box and whisker plots denote the median (middle line) with 25th (lower bound of box) and 75th percentiles (upper bound of box) as hinges; upper and lower whiskers extend from the hinge to 1.5*IQR (interquartile range). All individual samples' expression are plotted and outliers are those with expression values beyond the whisker.
+
+Difference in expression between C/G-CB in E/C or M/C conditions compared to GFP controls in E/C or M/C conditions, respectively, was determined using an unpaired two.sided non-parametric wilcoxon rank sum test. Primary C/G AML samples were compared to healthy normal bone marrows using same method as described.
+
+# 20. AUTHOR: Please confirm added asterisk definitions and specify the statistical test. *P < 0.05, **P < 0.005, ***P < 0.0005
+
+The significance values are denoted in figure 3B:
+    ns: p > 0.05
+    *: p <= 0.05
+    **: p <= 0.01
+    ***: p <= 0.001
+    ****: p <= 0.0001
+
+# 22. AUTHOR: See Query 19 regarding panels B and C.)
+
+OK to use the same definition above for boxplots.
